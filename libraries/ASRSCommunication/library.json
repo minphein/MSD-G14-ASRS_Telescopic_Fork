@@ -1,0 +1,21 @@
+{
+  "name": "ASRSCommunication",
+  "version": "0.2.0",
+  "description": "Communication protocol library for an Automated Storage and Retrieval System.",
+  "keywords": [
+    "ASRS",
+    "communication",
+    "UART",
+    "ESP-NOW",
+    "protocol"
+  ],
+  "frameworks": "arduino",
+  "platforms": [
+    "atmelavr",
+    "espressif32",
+    "renesas-ra"
+  ],
+  "headers": [
+    "ASRSCommunication.h"
+  ]
+}

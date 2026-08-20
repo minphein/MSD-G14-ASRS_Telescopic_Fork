@@ -1,0 +1,155 @@
+ASRS COMMUNICATION ARDUINO LIBRARY STRUCTURE
+============================================
+
+Purpose
+-------
+This folder is packaged as an Arduino-compatible library while remaining usable as a PlatformIO project library. The reusable communication protocol implementation is kept under src/ and is independent from the example firmware entry points.
+
+Library Root
+------------
+ASRSCommunication/
+
+Required Arduino library files:
+
+library.properties
+    Declares the library name, version, author metadata, category, supported architectures, and public include headers for the Arduino IDE.
+
+library.json
+    Declares equivalent metadata for PlatformIO registry or Git-based use.
+
+README.md
+    Describes installation, usage, architecture, and versioning policy.
+
+keywords.txt
+    Provides Arduino IDE syntax highlighting hints.
+
+src/ASRSCommunication.h
+    Convenience include header for applications that want one public library include.
+
+src/
+    Contains the reusable protocol, frame codec, transport, and role-layer implementation.
+    ASRS_Slave.cpp detects the optional companion ASRSMotion library with __has_include(<ASRS_Motion.h>). When ASRSMotion is present, enableMotionControl() can start direct tower-board stepper and limit-switch control. When ASRSMotion is absent, communication-only master and dummy-slave examples still compile, and enableMotionControl(true) is not enabled.
+    ASRS_Comm_SoftwareSerial supports Arduino Uno R3 and classic Arduino Nano style boards that need to keep USB Serial available for debugging. It uses Arduino SoftwareSerial with the same ASRS frame codec as hardware UART. The recommended initial rate is 9600 baud because SoftwareSerial is timing-sensitive.
+    ASRS_Comm_ESPNow also supports optional dynamic pairing. The master broadcasts ASRS_CMD_PAIR_REQUEST, and the slave accepts it only when ESP-NOW mode is selected and no master has already been paired. The slave responds with ASRS_CMD_PAIR_ACK. The learned master MAC address may be held in RAM only for shared-laboratory use, or stored in ESP32 non-volatile storage for a dedicated deployment.
+    ASRS_Comm_ESPNow registers ESP-NOW receive and send callbacks. The callbacks record delivery success, receive activity, consecutive delivery failures, and elapsed time since the last successful delivery or receive event so session firmware can distinguish normal idle time from likely peer loss.
+    ASRS_Comm_ESPNow consumes ASRS_CMD_HEARTBEAT and ASRS_CMD_HEARTBEAT_ACK internally. These transport-supervision packets do not appear as application packets to ASRS_Master or ASRS_Slave.
+    A master may call restartPairingMaster() after peer loss. This returns the master transport to broadcast pairing mode without reinitialising ESP-NOW, which supports recovery when a RAM-only paired slave resets.
+
+src/session/
+    Contains reusable ESP-NOW session managers.
+
+    ASRS_ESPNow_MasterSession manages master-side pairing, heartbeat transmission, peer activity timeout detection, and automatic re-pairing.
+
+    ASRS_ESPNow_SlaveSession manages slave-side DIP-gated pairing, heartbeat response handling, and peer activity timeout reporting.
+
+    Future application firmware should call the relevant session begin() method from setup(), call update() from loop(), and call recordPeerActivity() when a valid application-level packet is received from the paired peer.
+
+examples/
+    Contains Arduino IDE compatible template sketches.
+
+    Master_ESPNow_Template/
+        Minimal ESP32/ESP32-S3 master template using ESP-NOW dynamic pairing. It demonstrates coordinate request, homing, movement, and limit-switch request through ASRS_Master.
+
+    Master_UART_ESP32_Template/
+        Minimal ESP32/ESP32-S3 master template using hardware UART on configurable GPIO pins.
+
+    Master_UART_UnoNano_Template/
+        Minimal Arduino Uno R3 and classic Nano style master template using ASRS_Comm_SoftwareSerial. It keeps USB Serial available for debugging and uses 9600 baud by default.
+
+    Template_Dummy_Slave/
+        Simulated ESP32/ESP32-S3 slave template. GPIO2 HIGH selects ESP-NOW and GPIO2 LOW selects UART. The sketch publishes configurable dummy coordinates, limit-switch states, and operation status responses for master-firmware validation without the full ASRS mechanical system.
+
+    Only beginner-ready templates are packaged in the library examples folder. The fuller ESP-NOW master, motion-enabled slave, and standalone sensor diagnostic sketches remain in the wider PlatformIO research project rather than the packaged library examples.
+
+Compatibility Notes
+-------------------
+The library is intended to support both PlatformIO and Arduino IDE users. PlatformIO can consume this Arduino-style library directly from a project lib/ directory or from a Git repository. Arduino IDE users can copy the ASRSCommunication folder into Documents/Arduino/libraries/.
+
+The VL53L1X_Manager helper is optional and is compiled only when the SparkFun VL53L1X library header is available. This prevents a master-only communication project from requiring the sensor dependency.
+
+The ASRSMotion companion library is optional for communication-only use. It is required only when the application enables direct motion control through ASRS_Slave::enableMotionControl(true), such as the real motion-enabled Slave example.
+
+Arduino Uno R3 and classic Nano users should not use D0/RX and D1/TX for the ASRS link when Serial Monitor debugging is required. Those pins are shared with USB programming and debug Serial. Use ASRS_Comm_SoftwareSerial on other suitable digital pins instead. The PlatformIO template uses D10 as ASRS RX and D11 as ASRS TX by default, but those pins are configurable. Use level shifting when a 5 V Arduino TX signal connects to an ESP32-S3 RX pin.
+
+Versioning
+----------
+The current packaged library version is 0.2.0. Version 0.2.0 adds the complete three-controller examples and a raw ESP-NOW receive hook without changing the ASRS wire protocol. Minor version updates should be used for backward-compatible additions. Major version updates should be used when packet layout, command values, payload definitions, or public API behaviour are changed incompatibly.
+
+Protocol Commands Added for ESP-NOW Pairing
+-------------------------------------------
+ASRS_CMD_PAIR_REQUEST = 0x40
+    ESP-NOW master requests dynamic pairing.
+    Payload length: 4 bytes.
+    Payload: ASCII pairing marker "ASRS".
+
+ASRS_CMD_PAIR_ACK = 0x41
+    ESP-NOW slave confirms dynamic pairing.
+    Payload length: 4 bytes.
+    Payload: ASCII pairing marker "ASRS".
+
+ASRS_CMD_HEARTBEAT = 0x42
+    ESP-NOW master supervises an idle paired link.
+    Payload length: 0 bytes.
+    This command is consumed by the ESP-NOW transport/session layer.
+
+ASRS_CMD_HEARTBEAT_ACK = 0x43
+    ESP-NOW slave confirms heartbeat reception.
+    Payload length: 0 bytes.
+    This command is consumed by the ESP-NOW transport/session layer.
+
+These commands do not change the frame synchronization bytes, protocol version, CRC-16/CCITT calculation, byte order, or existing command payload definitions.
+
+Long-Running Operation Sequencing
+---------------------------------
+Travel and homing commands use one active-operation transaction.
+
+The master assigns the sequence number. The slave returns ACK, BUSY, DONE, or operation-related ERROR
+using that same sequence number. ACK confirms acceptance only. The master remains locked until matching
+DONE or ERROR status is received.
+
+ASRS_ERROR_MASTER_BUSY = 9
+    The master already has an active travel or homing operation.
+
+ASRS_ERROR_SLAVE_BUSY = 10
+    The slave already has an active travel or homing operation.
+
+ASRS_ERROR_LIMIT_REACHED = 11
+    The slave stopped motion because an active-LOW limit switch was reached in the commanded direction.
+
+ASRS_ERROR_SENSOR_MEASUREMENT_FAILED = 12
+    The slave could not obtain a valid VL53L1X coordinate measurement from tof1 or tof2.
+
+The current strict master implementation blocks coordinate and limit-switch requests while an operation
+is active. This avoids concurrent response routing until the transport receive path supports queued packets.
+
+ASRS_Slave can enable direct motion control through enableMotionControl(). When enabled,
+ASRS_Slave::processPacket() remains the command state machine: it validates travel and homing packets,
+retains the active command sequence, sends ACK, starts ASRSMotion, and publishes BUSY. ASRS_Slave::update()
+then services non-blocking motion, refreshes the internal coordinate and limit-switch state, and publishes
+DONE or ERROR.
+
+For the current motion-enabled slave firmware, ASRS_CMD_SET_MOVE is interpreted as an absolute X/Z target
+coordinate in millimetres. The slave computes the physical movement as target coordinate minus the current
+_coordinates value. If VL53L1X coordinate sensors are available, the slave measures tof1 and tof2 before
+the movement calculation. The packet layout remains two int32 values and is unchanged from the earlier travel-distance
+test format.
+
+For the current two-axis hardware test, ASRS_CMD_RETURN_HOME supports X homing, Z homing, or both axes
+using the existing homing mask. The slave drives X toward the active-LOW X-min limit switch on GPIO38 and
+drives Z toward the active-LOW Z-min limit switch on GPIO40. If both axes are requested in one command, the
+slave homes Z first, then homes X. Each requested axis stops when its minimum switch is reached, sets the
+corresponding stepper reference to 0, and the slave publishes DONE after all requested axes complete. The
+current slave firmware initializes the VL53L1X sensors inside ASRS_Slave. It measures tof1 as the X
+coordinate and tof2 as the Z coordinate during setup, then repeats the tof1/tof2 measurement before replying
+to each master coordinate request. tof3 remains a diagnostic sensor.
+
+The PlatformIO pairing examples demonstrate the operation lifecycle:
+
+src/Paring_master/main.cpp
+    Pairs dynamically, sends a travel command, waits for completion, verifies coordinates, sends a homing
+    command, waits for completion, and verifies coordinates again. The maintained master example also accepts
+    Serial Monitor commands: `RC`, `MOVE(x,z)`, `HOME(x,z)`, `STATUS`, and `HELP`.
+
+src/Pairing_slave/main.cpp
+    Pairs dynamically, acknowledges one accepted operation, reports BUSY, performs a non-blocking simulated
+    operation, and reports DONE with the original command sequence.
