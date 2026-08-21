@@ -32,6 +32,12 @@ ASRS-Telescopic-Fork/
 
 ## Architecture
 
+<p align="center">
+  <img src="docs/images/system%20architecture.png" width="900" alt="ASRS telescopic fork system architecture and connections">
+</p>
+
+<p align="center"><em>System architecture showing the fork ESP32 master, external ASRS tower controller, rack sensor node, local fork actuation and browser interface.</em></p>
+
 ```text
 Browser -- Wi-Fi/HTTP --> Fork ESP32 master
                               |-- STEP/DIR --> Y motor
@@ -45,6 +51,17 @@ The tower wire protocol is unchanged. A raw receive hook lets the fork consume r
 
 ## Hardware and default pins
 
+### Prototype hardware
+
+| Telescopic fork prototype | Four-slot storage rack prototype |
+| :---: | :---: |
+| <img src="docs/images/telescopic_fork.jpeg" width="420" alt="Telescopic fork prototype"> | <img src="docs/images/storage_rack.jpeg" width="420" alt="Four-slot storage rack prototype"> |
+| Bidirectional Y-axis telescopic fork with local drive and sensing hardware. | Two-by-two storage rack with one presence sensor for each slot. |
+
+The telescopic fork is mounted on the external ASRS tower, which provides X-axis and Z-axis movement. The fork mechanism supplies signed Y-axis extension from `-300 mm` to `+300 mm`, while the rack ESP32 reports whether each storage position is occupied or empty.
+
+### Fork master wiring
+
 Fork master:
 
 | Signal | GPIO |
@@ -55,6 +72,8 @@ Fork master:
 | Load-sensor ADC | 34 |
 | I2C SDA | 21 |
 | I2C SCL | 22 |
+
+### Rack sensor wiring
 
 Rack active-low sensors:
 
