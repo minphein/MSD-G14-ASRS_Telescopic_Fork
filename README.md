@@ -25,8 +25,6 @@ ASRS-Telescopic-Fork/
 │       ├── examples/                        Generic communication examples
 │       ├── library.properties
 │       └── library.json
-├── reference/
-│   └── tower-interface/                     Non-deployable interface reference
 ├── README.md
 ├── LICENSE
 └── .gitignore
@@ -67,7 +65,7 @@ Rack active-low sensors:
 | 3 | 27 |
 | 4 | 32 |
 
-The tower hardware and firmware are owned by another developer. This repository does not configure its motors, sensors, pins, or limits. The sketch under `reference/tower-interface/` only illustrates the expected `ASRSCommunication` session and is not deployment firmware.
+The tower hardware and firmware are owned by another developer. This repository does not contain tower firmware or configure its motors, sensors, pins, or limits. The fork integrates with the tower only through the agreed `ASRSCommunication` interface.
 
 ## Dependencies
 
@@ -75,14 +73,12 @@ Install **Adafruit VL53L0X** through Arduino Library Manager. The ESP32 Arduino 
 
 ## Install and upload
 
-1. Copy `libraries/ASRSCommunication` to `Documents/Arduino/libraries/ASRSCommunication`.
+1. Copy `libraries/ASRSCommunication` to `Arduino/libraries/ASRSCommunication`.
 2. Restart Arduino IDE and install Adafruit VL53L0X.
 3. Open `firmware/rack-slave/ASRS_Rack_Slave/ASRS_Rack_Slave.ino`, select the rack ESP32 and upload.
 4. Ask the tower developer to power the compatible tower firmware in ESP-NOW pairing mode.
 5. Open `firmware/fork-master/ASRS_Fork_Master/ASRS_Fork_Master.ino`, select the fork ESP32 and upload.
 6. Use Serial Monitor at `115200 baud` on the fork and rack for diagnostics.
-
-Do not upload anything under `reference/tower-interface/` to the supplied tower unless its developer explicitly authorizes and adopts it.
 
 All devices must use the same ESP-NOW channel (`1` by default).
 
