@@ -33,7 +33,7 @@ ASRS-Telescopic-Fork/
 ## Architecture
 
 <p align="center">
-  <img src="docs/images/system%20architecture.png" width="900" alt="ASRS telescopic fork system architecture and connections">
+  <img src="docs/images/system_architecture.png" width="900" alt="ASRS telescopic fork system architecture and connections">
 </p>
 
 <p align="center"><em>System architecture showing the fork ESP32 master, external ASRS tower controller, rack sensor node, local fork actuation and browser interface.</em></p>
