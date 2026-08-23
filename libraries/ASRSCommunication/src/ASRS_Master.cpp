@@ -220,6 +220,21 @@ bool ASRS_Master::waitForPacket(uint8_t expectedCommand,uint8_t expectedSequence
       return false;
     }
 
+    // The slave publishes BUSY immediately after ACK. The ESP-NOW transport
+    // has one receive slot, so BUSY can replace ACK before the master reads it.
+    // A matching BUSY status is equivalent proof that the command was accepted.
+    if (expectedCommand == ASRS_CMD_ACK &&
+        packet.cmd == ASRS_CMD_STATUS) {
+      ASRS_OperationStatus status;
+      if (!decodeStatus(packet, status)) {
+        return false;
+      }
+      if (status.status == ASRS_STATUS_BUSY) {
+        _lastError = ASRS_ERROR_NONE;
+        return true;
+      }
+    }
+
     if (packet.cmd == expectedCommand) {
       _lastError = ASRS_ERROR_NONE;
       return true;

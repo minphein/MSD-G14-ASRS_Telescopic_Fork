@@ -15,7 +15,12 @@
 constexpr char AP_SSID[] = "ASRS-Fork-Control";
 constexpr char AP_PASSWORD[] = "asrscontrol";
 constexpr uint8_t ESPNOW_CHANNEL = 1;
-constexpr uint32_t PAIR_TIMEOUT_MS = 10000;
+constexpr uint32_t PAIR_TIMEOUT_MS = 0;
+constexpr uint32_t REPAIR_ATTEMPT_TIMEOUT_MS = 50;
+constexpr uint32_t TOWER_SESSION_UPDATE_MS = 1000;
+constexpr uint32_t TOWER_OPERATION_TIMEOUT_MS = 120000;
+constexpr uint32_t TOWER_WAIT_LOG_MS = 2000;
+constexpr uint32_t TOWER_ACK_TIMEOUT_MS = 2000;
 
 constexpr uint8_t STEP_PIN = 14;
 constexpr uint8_t DIR_PIN = 27;
@@ -116,6 +121,8 @@ bool rackOccupied[4] = {false, false, false, false};
 bool rackOnline = false;
 uint32_t lastRackPacketMs = 0;
 uint32_t lastRackRequestMs = 0;
+uint32_t lastTowerSessionUpdateMs = 0;
+uint32_t lastTowerWaitLogMs = 0;
 uint16_t rackSequence = 0;
 const uint8_t BROADCAST_MAC[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
@@ -135,7 +142,8 @@ button,input,select{padding:10px;margin:5px;font-size:15px}button{cursor:pointer
 <button onclick="operate('pick')">Pick</button><button onclick="operate('place')">Place</button></p></div>
 <div class="card"><h2>Saved coordinates</h2><div id="locations"></div></div></div>
 <script>
-let active=true; async function cmd(u,o={method:'POST'}){let r=await fetch(u,o);alert(await r.text())}
+const state=document.getElementById('state'),message=document.getElementById('message'),x=document.getElementById('x'),y=document.getElementById('y'),z=document.getElementById('z'),load=document.getElementById('load'),tower=document.getElementById('tower'),rack=document.getElementById('rack'),slots=document.getElementById('slots'),locations=document.getElementById('locations');
+async function cmd(u,o={method:'POST'}){try{let r=await fetch(u,o);let t=await r.text();message.textContent=t;if(!r.ok)state.textContent='REQUEST ERROR'}catch(e){state.textContent='REQUEST ERROR';message.textContent=e.message}}
 function operate(t){cmd('/api/'+t+'?slot='+document.getElementById('slot').value)}
 async function save(i){let q=new URLSearchParams({slot:i,name:document.getElementById('n'+i).value,x:document.getElementById('x'+i).value,y:document.getElementById('y'+i).value,z:document.getElementById('z'+i).value});cmd('/api/location?'+q)}
 async function poll(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();
@@ -223,16 +231,29 @@ void updateYHoming() {
 }
 
 bool waitTowerTerminal() {
-  ASRS_OperationStatus s; if(!towerMaster.readOperationStatus(s)) return false;
+  ASRS_OperationStatus s;
+  if(!towerMaster.readOperationStatus(s)) {
+    if(millis()-lastTowerWaitLogMs>=TOWER_WAIT_LOG_MS){lastTowerWaitLogMs=millis();Serial.println("Waiting for tower BUSY/DONE/ERROR status");}
+    return false;
+  }
   towerSession.recordPeerActivity();
+  Serial.print("Tower status: ");Serial.println(asrsStatusName(s.status));
   if(s.status==ASRS_STATUS_ERROR) { fail(String("Tower error: ")+asrsErrorName(s.error)); return false; }
   if(s.status==ASRS_STATUS_DONE) { towerStationary=true; return true; }
   return false;
 }
 
-void beginHome() {
-  if(state!=READY && state!=ERROR_STATE && state!=SUCCESS && state!=BOOT) return;
+bool towerOperationTimedOut() {
+  if(millis()-stateStartedMs<=TOWER_OPERATION_TIMEOUT_MS) return false;
+  fail("Tower operation did not report DONE; reset required");
+  return true;
+}
+
+bool beginHome() {
+  if(state!=READY && state!=ERROR_STATE && state!=SUCCESS && state!=BOOT) return false;
+  if(towerMaster.operationActive()) return false;
   operation=OP_HOME; errorMessage=""; forkHomed=false; towerHomed=false; state=HOME_Y_SEARCH;
+  return true;
 }
 
 void updateOperation() {
@@ -240,10 +261,12 @@ void updateOperation() {
   if(state==HOME_Y_RETRACT && !yMoving) { state=HOME_TOWER_START; }
   if(state==HOME_TOWER_START) {
     if(!towerSession.connected()) return;
-    if(towerMaster.sendHomingCommand(true,true)) { towerSession.recordPeerActivity(); towerStationary=false; state=HOME_TOWER_WAIT; }
-    else fail(String("Tower homing rejected: ")+asrsErrorName(towerMaster.lastError()));
+    Serial.printf("Sending tower homing command; ACK timeout=%lu ms\n",(unsigned long)TOWER_ACK_TIMEOUT_MS);
+    if(towerMaster.sendHomingCommand(true,true,TOWER_ACK_TIMEOUT_MS)) { towerSession.recordPeerActivity(); towerStationary=false; stateStartedMs=millis(); Serial.println("Tower homing accepted"); state=HOME_TOWER_WAIT; }
+    else { Serial.printf("Tower homing ACK failed: %s\n",asrsErrorName(towerMaster.lastError())); fail(String("Tower homing rejected: ")+asrsErrorName(towerMaster.lastError())); }
   }
   if(state==HOME_TOWER_WAIT && waitTowerTerminal()) { towerHomed=true; towerCoordinates={X_HOME_MM,Z_HOME_MM}; operation=OP_NONE; state=READY; statusMessage="System homed and ready"; }
+  if(state==HOME_TOWER_WAIT && towerOperationTimedOut()) return;
   if(state==VALIDATE) {
     if(!forkHomed||!towerHomed) { fail("System must be homed"); return; }
     if(!rackOnline) { fail("Rack status is offline"); return; }
@@ -256,13 +279,14 @@ void updateOperation() {
   }
   if(state==MOVE_TOWER_START) {
     SavedLocation &p=locations[selectedSlot];
-    if(towerMaster.sendTravelCommand(p.x,p.z)) { towerSession.recordPeerActivity(); towerStationary=false; state=MOVE_TOWER_WAIT; }
+    if(towerMaster.sendTravelCommand(p.x,p.z,TOWER_ACK_TIMEOUT_MS)) { towerSession.recordPeerActivity(); towerStationary=false; stateStartedMs=millis(); state=MOVE_TOWER_WAIT; }
     else fail(String("Tower move rejected: ")+asrsErrorName(towerMaster.lastError()));
   }
   if(state==MOVE_TOWER_WAIT && waitTowerTerminal()) {
     SavedLocation &p=locations[selectedSlot]; towerCoordinates={p.x,p.z};
     if(!startYMove(p.y)) fail("Invalid or unavailable Y movement"); else state=EXTEND_Y;
   }
+  if(state==MOVE_TOWER_WAIT && towerOperationTimedOut()) return;
   if(state==EXTEND_Y && !yMoving) {
     transferStartZ=towerCoordinates.z; transferCurrentZ=transferStartZ; state=TRANSFER_CHECK;
   }
@@ -275,10 +299,11 @@ void updateOperation() {
   }
   if(state==TRANSFER_MOVE_START) {
     transferCurrentZ += operation==OP_PICK ? TRANSFER_Z_STEP_MM : -TRANSFER_Z_STEP_MM;
-    if(towerMaster.sendTravelCommand(towerCoordinates.x,transferCurrentZ)) { towerSession.recordPeerActivity(); towerStationary=false; state=TRANSFER_MOVE_WAIT; }
+    if(towerMaster.sendTravelCommand(towerCoordinates.x,transferCurrentZ,TOWER_ACK_TIMEOUT_MS)) { towerSession.recordPeerActivity(); towerStationary=false; stateStartedMs=millis(); state=TRANSFER_MOVE_WAIT; }
     else fail("Tower transfer step rejected");
   }
   if(state==TRANSFER_MOVE_WAIT && waitTowerTerminal()) { towerCoordinates.z=transferCurrentZ; state=TRANSFER_CHECK; }
+  if(state==TRANSFER_MOVE_WAIT && towerOperationTimedOut()) return;
   if(state==RETRACT_Y && !yMoving) { stateStartedMs=millis(); requestRackStatus(); state=VERIFY_RACK; }
   if(state==VERIFY_RACK) {
     bool expected=operation==OP_PLACE;
@@ -303,10 +328,10 @@ void loadLocations() {
 }
 
 void setupWeb() {
-  WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID,AP_PASSWORD,ESPNOW_CHANNEL); loadLocations();
+  WiFi.mode(WIFI_AP_STA); WiFi.setSleep(false); WiFi.softAP(AP_SSID,AP_PASSWORD,ESPNOW_CHANNEL); loadLocations();
   server.on("/",[](){server.send_P(200,"text/html",PAGE);}); server.on("/api/status",HTTP_GET,sendStatus);
   server.on("/api/heartbeat",HTTP_POST,[](){lastBrowserHeartbeat=millis();server.send(200,"text/plain","OK");});
-  server.on("/api/home",HTTP_POST,[](){beginHome();server.send(202,"text/plain","Homing requested");});
+  server.on("/api/home",HTTP_POST,[](){if(beginHome())server.send(202,"text/plain","Homing requested");else server.send(409,"text/plain","Homing already active or system busy");});
   server.on("/api/stop",HTTP_POST,[](){state=STOPPING;server.send(202,"text/plain","Stopping");});
   auto operationHandler=[](OperationType requested){
     if(state!=READY&&state!=SUCCESS){server.send(409,"text/plain","System is not ready");return;}
@@ -326,13 +351,22 @@ void setup() {
   Serial.begin(115200); pinMode(STEP_PIN,OUTPUT);pinMode(DIR_PIN,OUTPUT);pinMode(ENABLE_PIN,OUTPUT);pinMode(LOAD_SENSOR_PIN,INPUT);
   digitalWrite(STEP_PIN,LOW);digitalWrite(ENABLE_PIN,LOW);analogReadResolution(12);Wire.begin(I2C_SDA_PIN,I2C_SCL_PIN);
   ASRS_Comm_ESPNow::setRawReceiveHandler(rawRackReceiver);
+  setupWeb();updateLoad();
   if(!towerSession.begin(ESPNOW_CHANNEL,PAIR_TIMEOUT_MS,&Serial)) Serial.println("Tower not paired yet; session will continue recovery.");
+  towerSession.setRepairingTimeout(REPAIR_ATTEMPT_TIMEOUT_MS);
+  towerSession.setHeartbeatInterval(0);
+  towerSession.setLinkTimeout(0);
+  WiFi.mode(WIFI_AP_STA);WiFi.setSleep(false);
+  if(!WiFi.softAP(AP_SSID,AP_PASSWORD,ESPNOW_CHANNEL)) Serial.println("ERROR: Fork Wi-Fi AP failed after ESP-NOW startup");
+  else {Serial.print("Fork Wi-Fi ready: ");Serial.println(WiFi.softAPIP());}
   esp_now_peer_info_t peer={};memcpy(peer.peer_addr,BROADCAST_MAC,6);peer.channel=ESPNOW_CHANNEL;peer.encrypt=false;if(!esp_now_is_peer_exist(BROADCAST_MAC))esp_now_add_peer(&peer);
-  setupWeb(); updateLoad(); beginHome();
+  beginHome();
 }
 
 void loop() {
-  server.handleClient(); towerSession.update(); processRackPacket(); updateYMotor();
+  server.handleClient();
+  if(towerSession.connected()||millis()-lastTowerSessionUpdateMs>=TOWER_SESSION_UPDATE_MS){lastTowerSessionUpdateMs=millis();towerSession.update();}
+  processRackPacket(); updateYMotor();
   if(millis()-lastLoadUpdateMs>=LOAD_UPDATE_INTERVAL_MS){lastLoadUpdateMs=millis();updateLoad();}
   if(millis()-lastRackRequestMs>=RACK_REQUEST_MS){lastRackRequestMs=millis();requestRackStatus();}
   if(rackOnline&&millis()-lastRackPacketMs>RACK_OFFLINE_MS)rackOnline=false;

@@ -128,7 +128,8 @@ bool ASRS_Comm_ESPNow::beginPairingSlave(bool pairingAllowed, uint8_t channel, b
 
 bool ASRS_Comm_ESPNow::initialiseEspNow(uint8_t channel) {
   _channel = channel;
-  WiFi.mode(WIFI_STA);
+  const wifi_mode_t currentMode=WiFi.getMode();
+  WiFi.mode((currentMode==WIFI_AP||currentMode==WIFI_AP_STA)?WIFI_AP_STA:WIFI_STA);
   WiFi.disconnect(false, true);
   //initialize the espNow
   const esp_err_t initResult = esp_now_init();

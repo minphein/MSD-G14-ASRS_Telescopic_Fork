@@ -1,6 +1,6 @@
 {
   "name": "ASRSCommunication",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Communication protocol library for an Automated Storage and Retrieval System.",
   "keywords": [
     "ASRS",

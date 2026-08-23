@@ -73,7 +73,7 @@ Arduino Uno R3 and classic Nano users should not use D0/RX and D1/TX for the ASR
 
 Versioning
 ----------
-The current packaged library version is 0.2.0. Version 0.2.0 adds the complete three-controller examples and a raw ESP-NOW receive hook without changing the ASRS wire protocol. Minor version updates should be used for backward-compatible additions. Major version updates should be used when packet layout, command values, payload definitions, or public API behaviour are changed incompatibly.
+The initial packaged library version is 0.1.0. Minor version updates should be used for backward-compatible additions. Major version updates should be used when packet layout, command values, payload definitions, or public API behaviour are changed incompatibly.
 
 Protocol Commands Added for ESP-NOW Pairing
 -------------------------------------------
