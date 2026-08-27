@@ -145,10 +145,21 @@ Calibrate these thresholds using actual loaded and unloaded readings.
 - Live X/Y/Z, load, tower, and rack status
 - Four rack occupancy indicators
 - Pick, Place, Home, and Stop controls
+- Independent X/Y/Z Move, Pick, and Place controls that are not tied to rack slots
 - Four editable saved locations persisted with `Preferences`
 - Operation progress and error/success feedback
 
 Saved coordinates are validated against X `500...2500`, Y `-300...300`, and Z `400...1600` millimetres.
+
+### Independent coordinate operations
+
+The web interface accepts a manual X/Y/Z target independently from the four rack slots:
+
+- **Move to position** retracts Y, moves the tower to X/Z, waits for `DONE`, then extends Y to the requested coordinate.
+- **Pick here** performs the load-acquisition sequence at the entered coordinate without requiring a rack slot to be occupied.
+- **Place here** performs the load-release sequence without requiring a rack slot to be empty.
+
+Manual Pick still requires the fork to be unloaded, and Manual Place still requires a detected load. Rack occupancy validation and post-operation rack confirmation apply only to operations started from the Rack section. If Y is extended from a previous manual position, the controller retracts it to zero before issuing the next tower X/Z movement.
 
 ## Pick sequence
 
@@ -173,7 +184,11 @@ Place uses the inverse validation: the slot must be empty and the fork loaded. Z
 - Load state is validated before and during transfer.
 - Y outside `-300...300 mm` is rejected.
 - Rack data older than five seconds is offline.
-- The browser sends a 500 ms heartbeat. Loss for 2.5 seconds stops local Y motion and prevents subsequent tower commands.
+- The browser sends a 500 ms heartbeat, and successful status polling also renews the control lease. Loss for 10 seconds stops local Y motion and prevents subsequent tower commands.
+
+### Tower limit recovery
+
+When the tower reports `ASRS_ERROR_LIMIT_REACHED`, the fork master marks the tower stationary, invalidates its homed state, stops the active operation, and enables **Recover tower** on the web interface. Recovery retracts Y to zero if necessary, commands X/Z homing, waits for the tower's matching `DONE` status, updates the home coordinates, and returns the system to `READY`. Pick and Place remain blocked until recovery completes.
 
 ### Preserved-protocol stop limitation
 

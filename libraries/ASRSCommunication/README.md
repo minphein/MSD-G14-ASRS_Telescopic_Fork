@@ -4,6 +4,8 @@ ASRSCommunication is an Arduino-compatible C++ library for the Automated Storage
 
 The current release is version `0.1.0`. This version number indicates that the library is usable for staged testing, but the public API and protocol may still evolve during research development.
 
+The fork application treats `ASRS_ERROR_LIMIT_REACHED` as a recoverable tower stop. It requires an explicit web-triggered tower homing sequence before another pick or place operation is allowed; this application behavior does not change the ASRS wire protocol.
+
 ## Library Layers
 
 | Layer | Files | Responsibility |
