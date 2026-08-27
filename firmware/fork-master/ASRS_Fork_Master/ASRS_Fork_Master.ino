@@ -1,583 +1,1822 @@
-#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Preferences.h>
+#include <ESPmDNS.h>
+#include <esp_now.h>
+#include <esp_arduino_version.h>
+#include <esp_wifi.h>
+#include <ASRSCommunication.h>
+#include <ASRS_Master.h>
+#include <ASRS_Comm_ESPNow.h>
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
-#include <esp_now.h>
-#include <ASRSCommunication.h>
 
-#if !defined(ESP32)
-#error "ASRS_Fork_Master requires an ESP32."
-#endif
+// =====================================================
 
-// ---------------- User configuration ----------------
-constexpr char AP_SSID[] = "ASRS-Fork-Control";
-constexpr char AP_PASSWORD[] = "asrscontrol";
-constexpr uint8_t ESPNOW_CHANNEL = 1;
-constexpr uint32_t PAIR_TIMEOUT_MS = 0;
-constexpr uint32_t REPAIR_ATTEMPT_TIMEOUT_MS = 50;
-constexpr uint32_t TOWER_SESSION_UPDATE_MS = 1000;
-constexpr uint32_t TOWER_OPERATION_TIMEOUT_MS = 120000;
-constexpr uint32_t TOWER_WAIT_LOG_MS = 2000;
-constexpr uint32_t TOWER_ACK_TIMEOUT_MS = 2000;
-// The motion-enabled ASRS slave accepts absolute sensor-frame targets. The fork
-// UI uses logical coordinates whose X=0/Z=0 origin is captured after homing.
-constexpr bool TOWER_COMMANDS_ARE_RELATIVE = false;
+// HARDWARE & PIN DEFINITIONS
 
-constexpr uint8_t STEP_PIN = 14;
-constexpr uint8_t DIR_PIN = 27;
-constexpr uint8_t ENABLE_PIN = 26;
-constexpr uint8_t LOAD_SENSOR_PIN = 34;
-constexpr uint8_t I2C_SDA_PIN = 21;
-constexpr uint8_t I2C_SCL_PIN = 22;
+// =====================================================
 
-constexpr float Y_MIN_MM = -300.0f;
-constexpr float Y_MAX_MM = 300.0f;
-constexpr float Y_RETRACTED_TOLERANCE_MM = 2.0f;
-constexpr int FULL_STEPS_PER_REV = 200;
-constexpr int MICROSTEPS = 4;
-constexpr float PINION_DIAMETER_MM = 25.0f;
-constexpr float TOP_MM_PER_MOTOR_MM = 2.0f;
-constexpr float STEPS_PER_TOP_MM =
-    ((FULL_STEPS_PER_REV * MICROSTEPS) / (PI * PINION_DIAMETER_MM)) /
-    TOP_MM_PER_MOTOR_MM;
-constexpr uint32_t STEP_HALF_PERIOD_US = 800;
+#define STEP_PIN 14
 
-constexpr uint16_t HOMING_SENSOR_DISTANCE_MM = 30;
-constexpr float HOMING_RETRACT_TOP_MM = 320.0f;
-constexpr float MAX_HOMING_SECOND_STAGE_TRAVEL_MM = 1000.0f;
-const long MAX_HOMING_STEPS = lroundf(
-    MAX_HOMING_SECOND_STAGE_TRAVEL_MM * STEPS_PER_TOP_MM * TOP_MM_PER_MOTOR_MM);
-constexpr uint8_t HOMING_STEPS_PER_SENSOR_READ = 10;
+#define DIR_PIN 27
 
-constexpr int LOAD_DETECTED_THRESHOLD = 250;
-constexpr int LOAD_RELEASED_THRESHOLD = 350;
-constexpr uint8_t LOAD_SENSOR_SAMPLES = 8;
-constexpr uint32_t LOAD_STABLE_MS = 250;
-constexpr uint32_t LOAD_UPDATE_INTERVAL_MS = 20;
-constexpr uint32_t RACK_OFFLINE_MS = 5000;
-constexpr uint32_t RACK_REQUEST_MS = 2000;
-// Tower command acknowledgement can block the single-threaded web server for up
-// to TOWER_ACK_TIMEOUT_MS. Keep enough margin that a healthy browser is not
-// mistaken for a disconnected one while an X/Z command is being accepted.
-constexpr uint32_t WEB_LEASE_MS = 10000;
-constexpr int32_t TRANSFER_Z_STEP_MM = 2;
-constexpr int32_t MAX_TRANSFER_Z_MM = 30;
-constexpr int32_t X_HOME_MM = 0;
-constexpr int32_t Z_HOME_MM = 0;
+#define EN_PIN 26
 
-ASRS_Comm_ESPNow towerCommunication;
-ASRS_ESPNow_MasterSession towerSession(towerCommunication);
-ASRS_Master towerMaster(towerCommunication);
-WebServer server(80);
-Preferences preferences;
-Adafruit_VL53L0X homeSensor;
+#define I2C_SDA_PIN 21
 
-struct SavedLocation {
-  char name[20];
-  int32_t x;
-  int32_t y;
-  int32_t z;
-};
+#define I2C_SCL_PIN 22
 
-SavedLocation locations[4] = {
-  {"Slot 1", 2000, 300, 900}, {"Slot 2", 2000, 300, 1100},
-  {"Slot 3", 2200, 300, 900}, {"Slot 4", 2200, 300, 1100}
-};
-SavedLocation activeTarget = {"Manual", X_HOME_MM, 0, Z_HOME_MM};
-bool activeTargetUsesRack = false;
+// Connect the LM393 module's analog output (AO) to this ADC1 pin.
+// GPIO 34 is input-only and can be read while the ESP32 Wi-Fi is active.
+#define LOAD_SENSOR_PIN 34
 
-enum OperationType : uint8_t { OP_NONE, OP_PICK, OP_PLACE, OP_POSITION, OP_HOME };
-enum SystemState : uint8_t {
-  BOOT, HOME_Y_SEARCH, HOME_Y_RETRACT, HOME_TOWER_START, HOME_TOWER_WAIT,
-  READY, VALIDATE, PREPARE_RETRACT_Y, MOVE_TOWER_START, MOVE_TOWER_WAIT, EXTEND_Y,
-  TRANSFER_CHECK, TRANSFER_MOVE_START, TRANSFER_MOVE_WAIT, RETRACT_Y,
-  VERIFY_RACK, RECOVER_RETRACT_Y, RECOVER_TOWER_START, RECOVER_TOWER_WAIT,
-  SUCCESS, STOPPING, ERROR_STATE
-};
 
-SystemState state = BOOT;
-SystemState stoppedFromState = BOOT;
-OperationType operation = OP_NONE;
-String statusMessage = "Starting";
-String errorMessage;
-String stopReason;
-uint8_t selectedSlot = 0;
-bool forkHomed = false;
-bool towerHomed = false;
-bool towerStationary = false;
-bool towerRecoveryRequired = false;
-bool loadDetected = false;
+const int FULL_STEPS_PER_REV = 200;
+
+const int MICROSTEPS = 4;
+
+const float PINION_DIAMETER_MM = 25.0f;
+
+
+
+// Change this in code if the controller starts with the second stage already
+// sitting at a known position.
+const float INITIAL_SECOND_STAGE_POS_MM = 0.0f;
+
+// Third/top section movement ratio.
+// Example: 150 mm of second-stage motor/rack travel moves the third/top section
+// to the 300 mm coordinate, so the top section travel ratio is 2.0.
+const float TOP_MM_PER_MOTOR_MM = 2.0f;
+
+
+
+// Speed setting (Smaller = Faster)
+
+const unsigned int STEP_DELAY_US = 800;
+
+const bool INVERT_DIRECTION = false;
+
+// Sensor homing settings. The motor moves in the positive direction until the
+// VL53L0X reads this distance, then retracts by 320 mm of third-section travel.
+const uint16_t HOMING_SENSOR_DISTANCE_MM = 30;
+
+const float HOMING_RETRACT_TOP_MM = 320.0f;
+
+const float MAX_HOMING_SECOND_STAGE_TRAVEL_MM = 1000.0f;
+
+const int HOMING_STEPS_PER_SENSOR_READ = 10;
+
+// The observed analog values are about 600+ with no load and about 22 with a
+// load. Separate ON/OFF thresholds add hysteresis and prevent display chatter.
+const int LOAD_DETECTED_THRESHOLD = 250;
+const int LOAD_RELEASED_THRESHOLD = 350;
+const uint8_t LOAD_SENSOR_SAMPLES = 8;
+
+
+
+// =====================================================
+
+// MATH CALCULATION
+
+// =====================================================
+
+const float DISTANCE_PER_REV_MM = PI * PINION_DIAMETER_MM; // ~78.54 mm
+
+
+
+// Steps needed per 1 mm of MOTOR movement
+
+const float STEPS_PER_MM_MOTOR = (FULL_STEPS_PER_REV * MICROSTEPS) / DISTANCE_PER_REV_MM;
+
+
+
+// Steps needed per 1 mm of SECOND-STAGE motor/rack movement
+
+const float STEPS_PER_MM_SECOND_STAGE = STEPS_PER_MM_MOTOR;
+
+
+
+// Track state in mm
+
+float currentSecondStagePosMM = INITIAL_SECOND_STAGE_POS_MM;
+
+bool isMoving = false;
+
+bool isHoming = false;
+
+bool sensorReady = false;
+
+bool homeConfigured = false;
+
+uint16_t lastSensorDistanceMM = 0;
+
+String lastHomingMessage = "Not homed";
+
 int loadSensorValue = 0;
-uint32_t loadStateChangedMs = 0;
-uint32_t lastLoadUpdateMs = 0;
-float currentY = 0;
-float targetY = 0;
-bool yMoving = false;
-bool yDirection = false;
-long yStepsRemaining = 0;
-uint32_t nextStepUs = 0;
-bool stepLevel = false;
-long homingSteps = 0;
-uint8_t homingReadCounter = 0;
-uint32_t lastBrowserHeartbeat = 0;
-uint32_t stateStartedMs = 0;
-int32_t transferStartZ = 0;
-int32_t transferCurrentZ = 0;
+
+bool loadDetected = false;
+
+bool rackSlotOccupied[4] = {false, false, false, false};
+
+unsigned long lastRackUpdateMS = 0;
+
+bool rackHasReported = false;
+
+const unsigned long RACK_OFFLINE_TIMEOUT_MS = 5000;
+
+const uint32_t ESP_NOW_MAGIC = 0x46524B31; // "FRK1"
+const uint8_t ESP_NOW_VERSION = 1;
+const uint8_t ESP_NOW_RACK_STATUS = 1;
+const uint8_t ESP_NOW_STATUS_REQUEST = 2;
+const unsigned long ESP_NOW_REQUEST_INTERVAL_MS = 2000;
+
+struct __attribute__((packed)) ForkRackNowPacket {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t type;
+    uint16_t sequence;
+    uint8_t slots[4];
+    uint32_t uptimeMS;
+};
+
+const uint8_t ESP_NOW_BROADCAST_ADDRESS[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+bool espNowReady = false;
+uint16_t espNowSequence = 0;
+unsigned long previousEspNowRequestMS = 0;
+
+// The ASRS library owns the single ESP-NOW receive callback. Rack packets are
+// separated by the raw receive handler below; all other packets continue into
+// the ASRS protocol decoder.
+ASRS_Comm_ESPNow asrsCommunication;
+ASRS_ESPNow_MasterSession asrsSession(asrsCommunication);
+ASRS_Master asrsMaster(asrsCommunication);
+
 ASRS_Coordinates towerCoordinates = {0, 0};
-ASRS_Coordinates towerSensorHome = {0, 0};
-bool towerCoordinatesSynchronized = false;
+ASRS_LimitSwitches towerLimits = {false, false, false, false};
+bool towerCoordinatesValid = false;
+bool towerLimitsValid = false;
+bool towerSessionStarted = false;
+String towerOperation = "Idle";
+String towerMessage = "Waiting for ASRS tower";
+bool towerOperationCompletedEvent = false;
+bool towerOperationSucceeded = false;
+unsigned long previousTowerTelemetryMS = 0;
+unsigned long previousTowerSessionUpdateMS = 0;
+const unsigned long TOWER_TELEMETRY_INTERVAL_MS = 2500;
+const unsigned long TOWER_PAIRING_RETRY_INTERVAL_MS = 500;
+// Pair after the channel-1 access point has started. A zero initial timeout
+// initializes the transport without blocking setup on the radio's old channel.
+const uint32_t TOWER_INITIAL_PAIRING_TIMEOUT_MS = 0;
+const uint32_t TOWER_COMMAND_TIMEOUT_MS = 1500;
 
-volatile bool rackPacketPending = false;
-ASRS_RackPacket pendingRackPacket = {};
-bool rackOccupied[4] = {false, false, false, false};
-bool rackOnline = false;
-uint32_t lastRackPacketMs = 0;
-uint32_t lastRackRequestMs = 0;
-uint32_t lastTowerSessionUpdateMs = 0;
-uint32_t lastTowerWaitLogMs = 0;
-uint16_t rackSequence = 0;
-const uint8_t BROADCAST_MAC[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+// XYZ assignment workflow from the tower integration documentation:
+// X/Z are absolute tower coordinates in millimetres and Y is the fork
+// extension coordinate. The operator places the payload on the fork after it
+// reaches the requested pickup coordinate.
+enum AutoTransferState : uint8_t {
+    AUTO_IDLE,
+    AUTO_MOVE_TO_SOURCE,
+    AUTO_WAIT_SOURCE_TOWER,
+    AUTO_EXTEND_AT_SOURCE,
+    AUTO_WAIT_FOR_LOAD,
+    AUTO_RETRACT_FROM_SOURCE,
+    AUTO_MOVE_TO_DESTINATION,
+    AUTO_WAIT_DESTINATION_TOWER,
+    AUTO_EXTEND_AT_DESTINATION,
+    AUTO_WAIT_FOR_UNLOAD,
+    AUTO_RETRACT_FROM_DESTINATION,
+    AUTO_COMPLETE,
+    AUTO_ERROR
+};
 
-const char PAGE[] PROGMEM = R"HTML(
-<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ASRS Fork Master</title><style>
-body{font-family:Arial;background:#eef2f6;margin:0;padding:18px;color:#172033}.wrap{max-width:850px;margin:auto}
-.card{background:white;padding:16px;margin:12px 0;border-radius:12px;box-shadow:0 2px 8px #0002}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-.slot{padding:16px;border-radius:8px;color:white;background:#777}.empty{background:#198754}.occupied{background:#c62828}
-button,input,select{padding:10px;margin:5px;font-size:15px}button{cursor:pointer}.danger{background:#c62828;color:white}.ok{color:#198754}.bad{color:#c62828}
-</style></head><body><div class="wrap"><h1>ASRS Fork Control</h1>
-<div class="card"><b id="state">Loading...</b><p id="message"></p><p>X: <span id="x">-</span> mm | Y: <span id="y">-</span> mm | Z: <span id="z">-</span> mm</p>
-<p>Load: <span id="load">-</span> | Tower: <span id="tower">-</span> | Rack: <span id="rack">-</span></p>
-<button onclick="cmd('/api/home')">Home system</button><button id="recover" onclick="cmd('/api/recover')">Recover tower</button><button class="danger" onclick="cmd('/api/stop')">STOP</button></div>
-<div class="card"><h2>Rack</h2><div class="grid" id="slots"></div>
-<p><select id="slot"><option value="0">Slot 1</option><option value="1">Slot 2</option><option value="2">Slot 3</option><option value="3">Slot 4</option></select>
-<button onclick="operate('pick')">Pick</button><button onclick="operate('place')">Place</button></p></div>
-<div class="card"><h2>Independent coordinates</h2><p>Move, pick, or place at a coordinate that is not tied to a rack slot.</p>
-<input id="manualX" type="number" min="500" max="2500" value="500" placeholder="X mm"><input id="manualY" type="number" min="-300" max="300" value="0" placeholder="Y mm"><input id="manualZ" type="number" min="400" max="1600" value="400" placeholder="Z mm"><br>
-<button onclick="manual('move')">Move to position</button><button onclick="manual('pick')">Pick here</button><button onclick="manual('place')">Place here</button></div>
-<div class="card"><h2>Saved coordinates</h2><div id="locations"></div></div></div>
-<script>
-const state=document.getElementById('state'),message=document.getElementById('message'),x=document.getElementById('x'),y=document.getElementById('y'),z=document.getElementById('z'),load=document.getElementById('load'),tower=document.getElementById('tower'),rack=document.getElementById('rack'),slots=document.getElementById('slots'),locations=document.getElementById('locations'),recover=document.getElementById('recover');
-async function cmd(u,o={method:'POST'}){try{let r=await fetch(u,o);let t=await r.text();message.textContent=t;if(!r.ok)state.textContent='REQUEST ERROR'}catch(e){state.textContent='REQUEST ERROR';message.textContent=e.message}}
-function operate(t){cmd('/api/'+t+'?slot='+document.getElementById('slot').value)}
-function manual(t){let q=new URLSearchParams({type:t,x:document.getElementById('manualX').value,y:document.getElementById('manualY').value,z:document.getElementById('manualZ').value});cmd('/api/manual?'+q)}
-async function save(i){let q=new URLSearchParams({slot:i,name:document.getElementById('n'+i).value,x:document.getElementById('x'+i).value,y:document.getElementById('y'+i).value,z:document.getElementById('z'+i).value});cmd('/api/location?'+q)}
-async function poll(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();
-state.textContent=d.state;message.textContent=d.message+(d.error?' - '+d.error:'');x.textContent=d.x;y.textContent=d.y.toFixed(1);z.textContent=d.z;
-load.textContent=d.load?'DETECTED':'NOT DETECTED';tower.textContent=d.tower?'CONNECTED':'OFFLINE';rack.textContent=d.rack?'CONNECTED':'OFFLINE';
-recover.disabled=!d.recoverable;
-slots.innerHTML=d.slots.map((v,i)=>`<div class="slot ${d.rack?(v?'occupied':'empty'):''}">Slot ${i+1}<br>${d.rack?(v?'OCCUPIED':'EMPTY'):'UNKNOWN'}</div>`).join('');
-if(!document.getElementById('n0'))locations.innerHTML=d.locations.map((v,i)=>`<p><input id="n${i}" value="${v.name}"><input id="x${i}" type="number" value="${v.x}" placeholder="X"><input id="y${i}" type="number" value="${v.y}" placeholder="Y"><input id="z${i}" type="number" value="${v.z}" placeholder="Z"><button onclick="save(${i})">Save</button></p>`).join('');
-await fetch('/api/heartbeat',{method:'POST'});}catch(e){}setTimeout(poll,500)}poll();
-</script></body></html>)HTML";
+AutoTransferState autoTransferState = AUTO_IDLE;
+int32_t autoSourceX = 0;
+float autoSourceY = 0.0f;
+int32_t autoSourceZ = 0;
+int32_t autoDestinationX = 0;
+float autoDestinationY = 0.0f;
+int32_t autoDestinationZ = 0;
+String autoTransferMessage = "Idle";
+bool autoAbortRequested = false;
 
-const char *stateName() {
-  switch (state) {
-    case READY:return "READY"; case SUCCESS:return "SUCCESS"; case ERROR_STATE:return "ERROR";
-    case HOME_Y_SEARCH:case HOME_Y_RETRACT:case HOME_TOWER_START:case HOME_TOWER_WAIT:return "HOMING";
-    case RECOVER_RETRACT_Y:case RECOVER_TOWER_START:case RECOVER_TOWER_WAIT:return "RECOVERING";
-    case STOPPING:return "STOPPING"; default:return "OPERATING";
-  }
-}
+Adafruit_VL53L0X distanceSensor = Adafruit_VL53L0X();
 
-void fail(const String &message) {
-  yMoving = false; digitalWrite(STEP_PIN, LOW); stepLevel = false;
-  errorMessage = message; statusMessage = "Operation stopped"; state = ERROR_STATE;
-}
 
-bool requestStop(const String &reason) {
-  if(state==READY || state==SUCCESS || state==ERROR_STATE || state==STOPPING) return false;
-  stoppedFromState=state;
-  stopReason=reason;
-  state=STOPPING;
-  return true;
-}
 
-void finishStop() {
-  const bool yPositionUnknown=yMoving || stoppedFromState==BOOT || stoppedFromState==HOME_Y_SEARCH;
-  const bool towerPositionUnknown=towerMaster.operationActive();
+void updateLoadSensor() {
 
-  yMoving=false;
-  yStepsRemaining=0;
-  stepLevel=false;
-  digitalWrite(STEP_PIN,LOW);
-  digitalWrite(ENABLE_PIN,HIGH);
+    uint32_t total = 0;
 
-  if(yPositionUnknown) forkHomed=false;
-  if(towerPositionUnknown) {
-    towerHomed=false;
-    towerStationary=false;
-    towerRecoveryRequired=true;
-  }
+    for (uint8_t i = 0; i < LOAD_SENSOR_SAMPLES; i++) {
 
-  operation=OP_NONE;
-  errorMessage=stopReason.length()?stopReason:"Operation stopped";
-  statusMessage=towerPositionUnknown
-      ? "Local motion stopped; tower may still be moving"
-      : (yPositionUnknown ? "Stopped; Y homing required" : "Operation stopped");
-  state=ERROR_STATE;
-}
+        total += analogRead(LOAD_SENSOR_PIN);
 
-void monitorTowerAfterStop() {
-  if(state!=ERROR_STATE || !towerRecoveryRequired || !towerMaster.operationActive()) return;
-
-  ASRS_OperationStatus s;
-  if(!towerMaster.readOperationStatus(s)) return;
-  towerSession.recordPeerActivity();
-  if(s.status==ASRS_STATUS_BUSY) return;
-
-  towerStationary=true;
-  towerHomed=false;
-  if(s.status==ASRS_STATUS_ERROR)
-    errorMessage=String("Stopped operation; tower reported ")+asrsErrorName(s.error);
-  statusMessage="Tower is stationary; use Recover tower";
-}
-
-bool rawRackReceiver(const uint8_t *, const uint8_t *data, int length) {
-  if (!asrsIsRackPacket(data, length)) return false;
-  ASRS_RackPacket packet; memcpy(&packet, data, sizeof(packet));
-  if (packet.type == ASRS_RACK_STATUS) {
-    memcpy(&pendingRackPacket, &packet, sizeof(packet)); rackPacketPending = true;
-  }
-  return true;
-}
-
-void processRackPacket() {
-  if (!rackPacketPending) return;
-  noInterrupts(); ASRS_RackPacket packet = pendingRackPacket; rackPacketPending = false; interrupts();
-  for (uint8_t i=0;i<4;i++) rackOccupied[i] = packet.slots[i] != 0;
-  lastRackPacketMs = millis(); rackOnline = true;
-}
-
-void requestRackStatus() {
-  ASRS_RackPacket p={}; p.magic=ASRS_RACK_MAGIC; p.version=ASRS_RACK_VERSION;
-  p.type=ASRS_RACK_STATUS_REQUEST; p.sequence=++rackSequence; p.uptimeMs=millis();
-  esp_now_send(BROADCAST_MAC, reinterpret_cast<uint8_t*>(&p), sizeof(p));
-}
-
-void updateLoad() {
-  uint32_t total=0; for(uint8_t i=0;i<LOAD_SENSOR_SAMPLES;i++) total+=analogRead(LOAD_SENSOR_PIN);
-  loadSensorValue=total/LOAD_SENSOR_SAMPLES; bool previous=loadDetected;
-  if(!loadDetected && loadSensorValue<=LOAD_DETECTED_THRESHOLD) loadDetected=true;
-  else if(loadDetected && loadSensorValue>=LOAD_RELEASED_THRESHOLD) loadDetected=false;
-  if(previous!=loadDetected) loadStateChangedMs=millis();
-}
-
-bool stableLoad(bool expected) { return loadDetected==expected && millis()-loadStateChangedMs>=LOAD_STABLE_MS; }
-
-bool startYMove(float destination) {
-  if(destination<Y_MIN_MM || destination>Y_MAX_MM || yMoving || !forkHomed) return false;
-  float delta=destination-currentY; yStepsRemaining=lroundf(fabs(delta)*STEPS_PER_TOP_MM);
-  targetY=destination; yDirection=delta>0; digitalWrite(DIR_PIN,yDirection?HIGH:LOW);
-  digitalWrite(ENABLE_PIN,LOW); yMoving=yStepsRemaining>0; nextStepUs=micros();
-  if(!yMoving) currentY=destination; return true;
-}
-
-void updateYMotor() {
-  if(!yMoving || (int32_t)(micros()-nextStepUs)<0) return;
-  nextStepUs += STEP_HALF_PERIOD_US; stepLevel=!stepLevel; digitalWrite(STEP_PIN,stepLevel);
-  if(!stepLevel && --yStepsRemaining<=0) { yMoving=false; currentY=targetY; }
-}
-
-void updateYHoming() {
-  if(state==HOME_Y_SEARCH) {
-    if(!homeSensor.begin()) { fail("VL53L0X homing sensor not detected"); return; }
-    digitalWrite(ENABLE_PIN,LOW); digitalWrite(DIR_PIN,HIGH); state=BOOT; homingSteps=0; statusMessage="Searching for Y home sensor";
-  }
-  if(state!=BOOT || forkHomed) return;
-  if(++homingReadCounter>=HOMING_STEPS_PER_SENSOR_READ) {
-    homingReadCounter=0; VL53L0X_RangingMeasurementData_t m; homeSensor.rangingTest(&m,false);
-    if(m.RangeStatus!=4 && m.RangeMilliMeter<=HOMING_SENSOR_DISTANCE_MM) {
-      forkHomed=true; currentY=HOMING_RETRACT_TOP_MM; state=HOME_Y_RETRACT;
-      if(!startYMove(0)) fail("Could not retract after Y homing"); return;
     }
-  }
-  if(homingSteps++>=MAX_HOMING_STEPS) { fail("Y home sensor threshold not reached"); return; }
-  digitalWrite(STEP_PIN,HIGH); delayMicroseconds(STEP_HALF_PERIOD_US); digitalWrite(STEP_PIN,LOW); delayMicroseconds(STEP_HALF_PERIOD_US);
+
+    loadSensorValue = total / LOAD_SENSOR_SAMPLES;
+
+    if (!loadDetected && loadSensorValue <= LOAD_DETECTED_THRESHOLD) {
+
+        loadDetected = true;
+
+    } else if (loadDetected && loadSensorValue >= LOAD_RELEASED_THRESHOLD) {
+
+        loadDetected = false;
+
+    }
+
 }
 
-bool waitTowerTerminal() {
-  ASRS_OperationStatus s;
-  if(!towerMaster.readOperationStatus(s)) {
-    if(millis()-lastTowerWaitLogMs>=TOWER_WAIT_LOG_MS){lastTowerWaitLogMs=millis();Serial.println("Waiting for tower BUSY/DONE/ERROR status");}
-    return false;
-  }
-  towerSession.recordPeerActivity();
-  Serial.print("Tower status: ");Serial.println(asrsStatusName(s.status));
-  if(s.status==ASRS_STATUS_ERROR) {
-    if(s.error==ASRS_ERROR_LIMIT_REACHED) {
-      towerStationary=true;
-      towerHomed=false;
-      towerRecoveryRequired=true;
-      operation=OP_NONE;
-      errorMessage="Tower limit reached; use Recover tower";
-      statusMessage="Tower stopped and requires homing";
-      state=ERROR_STATE;
+// =====================================================
+
+// WEB SERVER SETUP
+
+// =====================================================
+
+const char* SETUP_AP_SSID = "Fork-WiFi-Setup";
+
+const char* SETUP_AP_PASSWORD = "forksetup";
+
+IPAddress forkAPIP(192, 168, 10, 1);
+
+IPAddress forkAPGateway(192, 168, 10, 1);
+
+IPAddress forkAPSubnet(255, 255, 255, 0);
+
+const unsigned long AP_HEALTH_CHECK_INTERVAL_MS = 5000;
+
+unsigned long previousAPHealthCheckMS = 0;
+
+const uint8_t FORK_WIFI_CHANNEL = 1;
+
+const uint8_t FORK_MAX_CLIENTS = 4;
+
+bool mdnsStarted = false;
+
+
+
+// Web interface operates on standard HTTP Port 80
+
+WebServer server(80);
+
+bool processAuxiliaryEspNowPacket(const uint8_t* senderMac, const uint8_t* data, int length) {
+    (void)senderMac;
+    if (length != sizeof(ForkRackNowPacket)) return false;
+
+    ForkRackNowPacket packet;
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.magic != ESP_NOW_MAGIC ||
+        packet.version != ESP_NOW_VERSION ||
+        packet.type != ESP_NOW_RACK_STATUS) return false;
+
+    for (uint8_t i = 0; i < 4; i++) {
+        rackSlotOccupied[i] = packet.slots[i] != 0;
+    }
+    lastRackUpdateMS = millis();
+    rackHasReported = true;
+    return true;
+}
+
+bool startIntegratedEspNow() {
+    // Select the shared radio channel before the ASRS master starts pairing.
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    if (esp_wifi_set_channel(FORK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+        Serial.println("ERROR: Could not select ESP-NOW channel 1");
+        return false;
+    }
+
+    ASRS_Comm_ESPNow::setRawReceiveHandler(processAuxiliaryEspNowPacket);
+    if (!asrsSession.begin(FORK_WIFI_CHANNEL,
+                           TOWER_INITIAL_PAIRING_TIMEOUT_MS,
+                           &Serial)) {
+        Serial.print("ERROR: ASRS ESP-NOW initialization failed: ");
+        Serial.println(asrsErrorName(asrsSession.lastError()));
+        return false;
+    }
+
+    // Short retry windows keep the fork web page responsive if the tower is off.
+    asrsSession.setRepairingTimeout(50);
+    asrsSession.setHeartbeatInterval(2000);
+    asrsSession.setLinkTimeout(7000);
+    towerSessionStarted = true;
+    towerMessage = asrsSession.connected() ? "ASRS tower connected" : "Pairing with ASRS tower";
+    Serial.println("Integrated rack + ASRS ESP-NOW coordinator ready");
+    return true;
+}
+
+void requestRackStatusNow() {
+    if (!espNowReady) return;
+    ForkRackNowPacket packet = {};
+    packet.magic = ESP_NOW_MAGIC;
+    packet.version = ESP_NOW_VERSION;
+    packet.type = ESP_NOW_STATUS_REQUEST;
+    packet.sequence = ++espNowSequence;
+    packet.uptimeMS = millis();
+    esp_now_send(ESP_NOW_BROADCAST_ADDRESS,
+                 reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+}
+
+
+
+bool startForkSetupAccessPoint() {
+
+    // Keep station mode active because the ASRS ESP-NOW transport uses it.
+    WiFi.mode(WIFI_AP_STA);
+
+    WiFi.setSleep(false);
+
+    if (!WiFi.softAPConfig(forkAPIP, forkAPGateway, forkAPSubnet)) {
+
+        Serial.println("ERROR: Fork AP IP configuration failed");
+
+        return false;
+
+    }
+
+    // hidden=false keeps the SSID visible; max clients allows the rack plus
+    // phones/laptops to remain connected simultaneously.
+    if (!WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD, FORK_WIFI_CHANNEL, false, FORK_MAX_CLIENTS)) {
+
+        Serial.println("ERROR: Fork Wi-Fi access point failed to start");
+
+        return false;
+
+    }
+
+    Serial.print("Fork setup AP ready at http://");
+
+    Serial.println(WiFi.softAPIP());
+
+    return true;
+
+}
+
+
+
+void startForkMDNS() {
+
+    // mDNS is served directly to clients connected to the fork access point.
+    if (!mdnsStarted && (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA)) {
+
+        mdnsStarted = MDNS.begin("fork-control");
+
+        if (mdnsStarted) {
+
+            MDNS.addService("http", "tcp", 80);
+
+            Serial.println("Fork available at http://fork-control.local");
+
+        }
+
+    }
+
+}
+
+
+
+void serviceNetworkDuringMotion() {
+
+    server.handleClient();
+
+    yield();
+
+}
+
+
+
+// =====================================================
+
+// MOTOR CONTROL
+
+// =====================================================
+
+void pulseMotorStep() {
+
+    digitalWrite(STEP_PIN, HIGH);
+
+    delayMicroseconds(STEP_DELAY_US);
+
+    digitalWrite(STEP_PIN, LOW);
+
+    delayMicroseconds(STEP_DELAY_US);
+
+}
+
+
+
+void moveMotorSteps(long steps, bool direction) {
+
+    bool actualDirection = direction ^ INVERT_DIRECTION;
+
+    digitalWrite(DIR_PIN, actualDirection ? HIGH : LOW);
+
+    delayMicroseconds(100); // DIR settle time
+
+
+
+    for (long i = 0; i < steps; i++) {
+
+
+        pulseMotorStep();
+
+
+
+        // Service Wi-Fi about every 32 ms at the configured step speed.
+
+        if (i % 20 == 0) serviceNetworkDuringMotion();
+
+    }
+
+}
+
+
+
+bool readHomingDistance(uint16_t &distanceMM) {
+
+    VL53L0X_RangingMeasurementData_t measurement;
+
+    distanceSensor.rangingTest(&measurement, false);
+
+    if (measurement.RangeStatus == 4) {
+
+        return false;
+
+    }
+
+    distanceMM = measurement.RangeMilliMeter;
+
+    lastSensorDistanceMM = distanceMM;
+
+    return true;
+
+}
+
+
+
+bool runSensorHoming() {
+
+    if (isMoving || !sensorReady) {
+
+        lastHomingMessage = sensorReady ? "Motor is busy" : "VL53L0X not detected";
+
+        return false;
+
+    }
+
+    isMoving = true;
+
+    isHoming = true;
+
+    homeConfigured = false;
+
+    lastHomingMessage = "Searching for home sensor";
+
+    digitalWrite(EN_PIN, LOW);
+
+
+
+    bool actualDirection = true ^ INVERT_DIRECTION;
+
+    digitalWrite(DIR_PIN, actualDirection ? HIGH : LOW);
+
+    delayMicroseconds(100);
+
+
+
+    const long maxHomingSteps = lroundf(
+
+        MAX_HOMING_SECOND_STAGE_TRAVEL_MM * STEPS_PER_MM_SECOND_STAGE
+
+    );
+
+    long stepsMoved = 0;
+
+    bool sensorTriggered = false;
+
+
+
+    while (stepsMoved < maxHomingSteps) {
+
+        uint16_t distanceMM;
+
+        if (readHomingDistance(distanceMM) && distanceMM <= HOMING_SENSOR_DISTANCE_MM) {
+
+            sensorTriggered = true;
+
+            break;
+
+        }
+
+
+
+        for (int i = 0; i < HOMING_STEPS_PER_SENSOR_READ && stepsMoved < maxHomingSteps; i++) {
+
+            pulseMotorStep();
+
+            stepsMoved++;
+
+        }
+
+        serviceNetworkDuringMotion();
+
+    }
+
+
+
+    if (!sensorTriggered) {
+
+        currentSecondStagePosMM += stepsMoved / STEPS_PER_MM_SECOND_STAGE;
+
+        lastHomingMessage = "Home failed: sensor threshold not reached";
+
+        homeConfigured = false;
+
+        isHoming = false;
+
+        isMoving = false;
+
+        return false;
+
+    }
+
+
+
+    // The sensor point is 320 mm of third-section travel away from working zero.
+    // Convert that top-section distance to the 160 mm second-stage retraction.
+    const float retractSecondStageMM = HOMING_RETRACT_TOP_MM / TOP_MM_PER_MOTOR_MM;
+
+    currentSecondStagePosMM = retractSecondStageMM;
+
+    long retractSteps = lroundf(retractSecondStageMM * STEPS_PER_MM_SECOND_STAGE);
+
+    moveMotorSteps(retractSteps, false);
+
+    currentSecondStagePosMM = 0.0f;
+
+
+
+    homeConfigured = true;
+
+    lastHomingMessage = "Home position is configured";
+
+    isHoming = false;
+
+    isMoving = false;
+
+    return true;
+
+}
+
+
+
+float getCurrentTopPosMM() {
+
+    return currentSecondStagePosMM * TOP_MM_PER_MOTOR_MM;
+
+}
+
+
+
+void moveToSecondStagePosition(float targetSecondStageMM) {
+
+    if (isMoving) return;
+
+    isMoving = true;
+
+
+
+    // Calculate distance the second stage motor/rack needs to travel
+
+    float deltaSecondStageMM = targetSecondStageMM - currentSecondStagePosMM;
+
+
+
+    // Calculate required steps
+
+    long stepsToMove = lroundf(fabs(deltaSecondStageMM) * STEPS_PER_MM_SECOND_STAGE);
+
+
+
+    if (stepsToMove > 0) {
+
+        // Positive move = true direction, Negative move = false direction
+
+        bool direction = (deltaSecondStageMM > 0);
+
+        
+
+        // Digital drive execution
+
+        digitalWrite(EN_PIN, LOW); // Enable motor
+
+        moveMotorSteps(stepsToMove, direction);
+
+        
+
+        // Update current position tracker
+
+        currentSecondStagePosMM = targetSecondStageMM;
+
+    }
+
+
+
+    isMoving = false;
+
+}
+
+
+void moveToTopPosition(float targetTopMM) {
+
+    // Web/API coordinates describe the third (top) section. Convert the
+    // requested coordinate to the corresponding second-stage motor position.
+    moveToSecondStagePosition(targetTopMM / TOP_MM_PER_MOTOR_MM);
+
+}
+
+
+
+// =====================================================
+
+// WEB INTERFACE (HTML + JS)
+
+// =====================================================
+
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>MSD G14 Fork Control</title>
+
+    <style>
+
+        body { font-family: Arial, sans-serif; text-align: center; margin-top: 30px; background-color: #f4f4f9; color: #333; }
+
+        .card { background: white; max-width: 400px; margin: auto; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+
+        h2 { margin-bottom: 5px; }
+
+        .pos-display { font-size: 2rem; font-weight: bold; color: #007bff; margin: 15px 0; }
+
+        .sub-text { font-size: 0.9rem; color: #666; margin-bottom: 20px; }
+
+        input[type=number] { width: 70%; padding: 10px; font-size: 1.2rem; border: 1px solid #ccc; border-radius: 6px; text-align: center; }
+
+        button { width: 80%; padding: 12px; margin: 8px 0; font-size: 1rem; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; }
+
+        .btn-move { background-color: #007bff; color: white; font-weight: bold; }
+
+        .btn-move:hover { background-color: #0056b3; }
+
+        .btn-preset { background-color: #e2e8f0; color: #333; width: 24%; display: inline-block; }
+
+        .btn-preset:hover { background-color: #cbd5e1; }
+
+        .btn-zero { background-color: #dc3545; color: white; width: 80%; }
+
+        .status { font-style: italic; color: #888; margin-top: 15px; }
+
+        .home-state { margin: 12px 0; padding: 10px; border-radius: 6px; background-color: #fff3cd; color: #856404; font-weight: bold; }
+
+        .home-state.configured { background-color: #d4edda; color: #155724; }
+
+        .load-state { margin: 12px 0; padding: 12px; border-radius: 6px; background-color: #e2e8f0; color: #475569; font-weight: bold; }
+
+        .load-state.detected { background-color: #d4edda; color: #155724; }
+
+        .rack-panel { margin-top: 18px; padding: 12px; border-radius: 10px; background: #333; }
+
+        .rack-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+
+        .rack-slot { padding: 14px 5px; border-radius: 7px; color: white; background: #757575; font-weight: bold; }
+
+        .rack-slot.occupied { background: #c62828; }
+
+        .rack-slot.empty { background: #2e7d32; }
+
+        .rack-connection { margin: 10px 0; font-weight: bold; color: #dc3545; }
+
+        .rack-connection.online { color: #155724; }
+
+        .tower-panel { margin-top: 20px; padding: 14px; border-radius: 10px; background: #eef6ff; }
+
+        .tower-input { width: 42% !important; margin: 4px; }
+
+        .tower-state { margin: 10px 0; font-weight: bold; color: #b91c1c; }
+
+        .tower-state.online { color: #166534; }
+
+        .xyz-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+
+        .xyz-grid input { width: 100% !important; padding: 8px; font-size: 1rem; }
+
+        .btn-abort { background-color: #b91c1c; color: white; }
+
+    </style>
+
+</head>
+
+<body>
+
+    <div class="card">
+
+        <h2>MSD G14 Fork Control</h2>
+
+        <div class="sub-text">Second Stage Target Control</div>
+
+        <div class="sub-text">Fork webserver: <span id="forkWiFi">CHECKING</span> | <a href="/wifi">Wi-Fi setup</a></div>
+
+
+
+        <div>Third Section Current Position:</div>
+
+        <div class="pos-display"><span id="currPos">0.0</span> mm</div>
+
+
+
+        <input type="number" id="targetInput" placeholder="Enter third section target (mm)" step="1" value="0"><br><br>
+
+        <button class="btn-move" onclick="sendMove()">MOVE TO POSITION</button>
+
+
+
+        <div style="margin-top: 15px;">
+
+            <button class="btn-preset" onclick="setAndMove(-300)">-300</button>
+
+            <button class="btn-preset" onclick="setAndMove(-150)">-150</button>
+
+            <button class="btn-preset" onclick="setAndMove(150)">+150</button>
+
+            <button class="btn-preset" onclick="setAndMove(300)">+300</button>
+
+        </div>
+
+
+
+        <hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;">
+
+        <button class="btn-move" onclick="goHome()">HOME TO ZERO</button>
+
+        <button class="btn-move" id="homingButton" onclick="sensorHome()">START HOMING</button>
+
+        <div class="home-state" id="homeState">Home position is not configured</div>
+
+        <div class="load-state" id="loadState">LOAD NOT DETECTED</div>
+
+        <div class="sub-text">Pressure sensor: <span id="loadValue">--</span></div>
+
+        <div class="rack-connection" id="rackConnection">RACK OFFLINE</div>
+
+        <div class="rack-panel">
+
+            <div class="rack-grid">
+
+                <div class="rack-slot" id="rackSlot1">SLOT 1<br>UNKNOWN</div>
+
+                <div class="rack-slot" id="rackSlot2">SLOT 2<br>UNKNOWN</div>
+
+                <div class="rack-slot" id="rackSlot3">SLOT 3<br>UNKNOWN</div>
+
+                <div class="rack-slot" id="rackSlot4">SLOT 4<br>UNKNOWN</div>
+
+            </div>
+
+        </div>
+
+        <div class="sub-text" style="margin-top: 10px;">Occupied: <span id="rackOccupied">0</span> | Empty: <span id="rackEmpty">0</span></div>
+
+        <div class="tower-panel">
+
+            <h3>ASRS Tower X / Z</h3>
+
+            <div class="tower-state" id="towerConnection">TOWER OFFLINE</div>
+
+            <div>Current: X <span id="towerX">--</span>, Z <span id="towerZ">--</span></div>
+
+            <input class="tower-input" type="number" id="towerTargetX" placeholder="Target X" step="1" value="0">
+
+            <input class="tower-input" type="number" id="towerTargetZ" placeholder="Target Z" step="1" value="0">
+
+            <button class="btn-move" onclick="moveTower()">MOVE X AND Z</button>
+
+            <label><input type="checkbox" id="homeX" checked> Home X</label>&nbsp;&nbsp;
+
+            <label><input type="checkbox" id="homeZ" checked> Home Z</label>
+
+            <button class="btn-zero" onclick="homeTower()">HOME SELECTED AXES</button>
+
+            <div class="sub-text">Operation: <span id="towerOperation">Idle</span></div>
+
+            <div class="sub-text" id="towerMessage">Waiting for ASRS tower</div>
+
+        </div>
+
+        <div class="tower-panel">
+
+            <h3>Automatic XYZ Transfer</h3>
+
+            <div class="sub-text">Absolute coordinates in mm. Y is fork extension (-300 to +300).</div>
+
+            <b>Pickup coordinate</b>
+
+            <div class="xyz-grid">
+
+                <input type="number" id="sourceX" placeholder="X" value="0">
+
+                <input type="number" id="sourceY" placeholder="Y" value="300">
+
+                <input type="number" id="sourceZ" placeholder="Z" value="0">
+
+            </div>
+
+            <br><b>Destination coordinate</b>
+
+            <div class="xyz-grid">
+
+                <input type="number" id="destinationX" placeholder="X" value="1600">
+
+                <input type="number" id="destinationY" placeholder="Y" value="300">
+
+                <input type="number" id="destinationZ" placeholder="Z" value="740">
+
+            </div>
+
+            <button class="btn-move" onclick="startTransfer()">START PICK AND PLACE</button>
+
+            <button class="btn-abort" onclick="abortTransfer()">ABORT SEQUENCE</button>
+
+            <div class="tower-state" id="autoState">IDLE</div>
+
+            <div class="sub-text" id="autoMessage">Home the fork before starting.</div>
+
+        </div>
+
+
+
+        <div class="status" id="statusText">Ready</div>
+
+    </div>
+
+
+
+    <script>
+
+        function updateStatus() {
+
+            return fetch('/status')
+
+                .then(r => r.json())
+
+                .then(data => {
+
+                    document.getElementById('currPos').innerText = data.topPos.toFixed(1);
+
+                    document.getElementById('forkWiFi').innerText = data.apIP;
+
+                    const homeState = document.getElementById('homeState');
+
+                    const loadState = document.getElementById('loadState');
+
+                    document.getElementById('loadValue').innerText = data.loadSensorValue;
+
+                    if (data.loadDetected) {
+
+                        loadState.innerText = 'LOAD DETECTED';
+
+                        loadState.classList.add('detected');
+
+                    } else {
+
+                        loadState.innerText = 'LOAD NOT DETECTED';
+
+                        loadState.classList.remove('detected');
+
+                    }
+
+                    updateRackDisplay(data);
+
+                    updateTowerDisplay(data);
+
+                    document.getElementById('autoState').innerText = data.autoTransferActive ? 'TRANSFER RUNNING' : 'IDLE';
+
+                    document.getElementById('autoState').classList.toggle('online', data.autoTransferActive);
+
+                    document.getElementById('autoMessage').innerText = data.autoTransferMessage;
+
+                    if (data.homing) {
+
+                        homeState.innerText = 'Homing in progress...';
+
+                        homeState.classList.remove('configured');
+
+                    } else if (data.homeConfigured) {
+
+                        homeState.innerText = 'Home position is configured';
+
+                        homeState.classList.add('configured');
+
+                    } else {
+
+                        homeState.innerText = 'Home position is not configured';
+
+                        homeState.classList.remove('configured');
+
+                    }
+
+                    if (data.moving) {
+
+                        document.getElementById('statusText').innerText = 'Moving...';
+
+                    } else {
+
+                        document.getElementById('statusText').innerText = 'Ready';
+
+                    }
+
+                });
+
+        }
+
+
+
+        function updateRackDisplay(data) {
+
+            const connection = document.getElementById('rackConnection');
+
+            connection.innerText = data.rackConnected ? 'RACK CONNECTED (ESP-NOW)' : 'RACK OFFLINE';
+
+            connection.classList.toggle('online', data.rackConnected);
+
+            document.getElementById('rackOccupied').innerText = data.rackConnected ? data.rackOccupiedCount : 0;
+
+            document.getElementById('rackEmpty').innerText = data.rackConnected ? data.rackEmptyCount : 0;
+
+            for (let i = 1; i <= 4; i++) {
+
+                const slot = document.getElementById('rackSlot' + i);
+
+                slot.className = 'rack-slot';
+
+                if (!data.rackConnected) {
+
+                    slot.innerHTML = 'SLOT ' + i + '<br>UNKNOWN';
+
+                } else if (data['rackSlot' + i]) {
+
+                    slot.innerHTML = 'SLOT ' + i + '<br>OCCUPIED';
+
+                    slot.classList.add('occupied');
+
+                } else {
+
+                    slot.innerHTML = 'SLOT ' + i + '<br>EMPTY';
+
+                    slot.classList.add('empty');
+
+                }
+
+            }
+
+        }
+
+        function updateTowerDisplay(data) {
+
+            const connection = document.getElementById('towerConnection');
+
+            connection.innerText = data.towerConnected ? 'TOWER CONNECTED (ESP-NOW)' : 'TOWER OFFLINE';
+
+            connection.classList.toggle('online', data.towerConnected);
+
+            document.getElementById('towerX').innerText = data.towerCoordinatesValid ? data.towerX : '--';
+
+            document.getElementById('towerZ').innerText = data.towerCoordinatesValid ? data.towerZ : '--';
+
+            document.getElementById('towerOperation').innerText = data.towerOperation;
+
+            document.getElementById('towerMessage').innerText = data.towerMessage;
+
+        }
+
+        function towerRequest(url) {
+
+            document.getElementById('towerMessage').innerText = 'Sending command...';
+
+            fetch(url)
+
+                .then(async r => ({ ok: r.ok, message: await r.text() }))
+
+                .then(result => {
+
+                    document.getElementById('towerMessage').innerText = result.message;
+
+                    return updateStatus();
+
+                })
+
+                .catch(() => document.getElementById('towerMessage').innerText = 'Tower request failed');
+
+        }
+
+        function moveTower() {
+
+            const x = document.getElementById('towerTargetX').value;
+
+            const z = document.getElementById('towerTargetZ').value;
+
+            if (x === '' || z === '') return;
+
+            towerRequest('/tower-move?x=' + encodeURIComponent(x) + '&z=' + encodeURIComponent(z));
+
+        }
+
+        function homeTower() {
+
+            const x = document.getElementById('homeX').checked ? '1' : '0';
+
+            const z = document.getElementById('homeZ').checked ? '1' : '0';
+
+            towerRequest('/tower-home?x=' + x + '&z=' + z);
+
+        }
+
+        function startTransfer() {
+
+            const ids = ['sourceX', 'sourceY', 'sourceZ', 'destinationX', 'destinationY', 'destinationZ'];
+
+            const values = ids.map(id => document.getElementById(id).value);
+
+            if (values.some(value => value === '')) return;
+
+            const query = '?sx=' + encodeURIComponent(values[0]) +
+
+                          '&sy=' + encodeURIComponent(values[1]) +
+
+                          '&sz=' + encodeURIComponent(values[2]) +
+
+                          '&dx=' + encodeURIComponent(values[3]) +
+
+                          '&dy=' + encodeURIComponent(values[4]) +
+
+                          '&dz=' + encodeURIComponent(values[5]);
+
+            towerRequest('/auto-transfer' + query);
+
+        }
+
+        function abortTransfer() {
+
+            towerRequest('/auto-abort');
+
+        }
+
+
+
+        function sendMove() {
+
+            let val = document.getElementById('targetInput').value;
+
+            if (val === '') return;
+
+            document.getElementById('statusText').innerText = 'Command sent...';
+
+            fetch('/move?pos=' + val)
+
+                .then(() => setTimeout(updateStatus, 500));
+
+        }
+
+
+
+        function setAndMove(val) {
+
+            document.getElementById('targetInput').value = val;
+
+            sendMove();
+
+        }
+
+
+
+        function goHome() {
+
+            document.getElementById('targetInput').value = 0;
+
+            sendMove();
+
+        }
+
+
+
+        function sensorHome() {
+
+            const button = document.getElementById('homingButton');
+
+            const homeState = document.getElementById('homeState');
+
+            button.disabled = true;
+
+            homeState.innerText = 'Homing in progress...';
+
+            homeState.classList.remove('configured');
+
+            document.getElementById('statusText').innerText = 'Moving toward sensor...';
+
+            fetch('/sensorhome')
+
+                .then(async r => ({ ok: r.ok, message: await r.text() }))
+
+                .then(result => {
+
+                    document.getElementById('statusText').innerText = result.message;
+
+                    return updateStatus();
+
+                })
+
+                .catch(() => {
+
+                    document.getElementById('statusText').innerText = 'Homing request failed';
+
+                })
+
+                .finally(() => {
+
+                    button.disabled = false;
+
+                });
+
+        }
+
+
+
+        setInterval(updateStatus, 1000);
+
+        updateStatus();
+
+    </script>
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+
+// =====================================================
+
+// ROUTE HANDLERS
+
+// =====================================================
+
+void updateTowerOperation() {
+    if (!asrsMaster.operationActive()) return;
+
+    ASRS_OperationStatus status;
+    if (!asrsMaster.readOperationStatus(status)) return;
+
+    asrsSession.recordPeerActivity();
+    if (status.status == ASRS_STATUS_BUSY) {
+        towerMessage = towerOperation + " in progress";
+    } else if (status.status == ASRS_STATUS_DONE) {
+        towerMessage = towerOperation + " completed";
+        towerOperation = "Idle";
+        towerOperationSucceeded = true;
+        towerOperationCompletedEvent = true;
+        previousTowerTelemetryMS = 0;
+    } else if (status.status == ASRS_STATUS_ERROR) {
+        towerMessage = towerOperation + " failed: " + String(asrsErrorName(status.error));
+        towerOperation = "Idle";
+        towerOperationSucceeded = false;
+        towerOperationCompletedEvent = true;
+    }
+}
+
+bool startTowerMove(int32_t targetX, int32_t targetZ, const String &operationName) {
+    if (!asrsSession.connected() || asrsMaster.operationActive()) return false;
+
+    towerOperationCompletedEvent = false;
+    towerOperationSucceeded = false;
+    if (!asrsMaster.sendTravelCommand(targetX, targetZ, TOWER_COMMAND_TIMEOUT_MS)) {
+        towerMessage = operationName + " rejected: " + String(asrsErrorName(asrsMaster.lastError()));
+        return false;
+    }
+
+    asrsSession.recordPeerActivity();
+    towerOperation = operationName;
+    towerMessage = operationName + " accepted: X=" + String(targetX) + ", Z=" + String(targetZ);
+    return true;
+}
+
+void failAutoTransfer(const String &message) {
+    autoTransferMessage = message;
+    autoTransferState = AUTO_ERROR;
+}
+
+void updateAutoTransfer() {
+    if (autoTransferState == AUTO_IDLE) return;
+
+    updateLoadSensor();
+
+    if (autoAbortRequested && !asrsMaster.operationActive()) {
+        autoAbortRequested = false;
+        autoTransferMessage = "Transfer aborted; retracting fork";
+        moveToTopPosition(0.0f);
+        autoTransferState = AUTO_IDLE;
+        return;
+    }
+
+    switch (autoTransferState) {
+        case AUTO_MOVE_TO_SOURCE:
+            autoTransferMessage = "Moving tower to pickup X/Z";
+            if (startTowerMove(autoSourceX, autoSourceZ, "Moving to pickup")) {
+                autoTransferState = AUTO_WAIT_SOURCE_TOWER;
+            } else {
+                failAutoTransfer("Could not start pickup tower move: " + towerMessage);
+            }
+            break;
+
+        case AUTO_WAIT_SOURCE_TOWER:
+            if (towerOperationCompletedEvent) {
+                towerOperationCompletedEvent = false;
+                if (towerOperationSucceeded) {
+                    autoTransferState = AUTO_EXTEND_AT_SOURCE;
+                } else {
+                    failAutoTransfer("Tower failed to reach pickup coordinate");
+                }
+            }
+            break;
+
+        case AUTO_EXTEND_AT_SOURCE:
+            autoTransferMessage = "Extending fork to pickup Y=" + String(autoSourceY, 1) + " mm";
+            moveToTopPosition(autoSourceY);
+            autoTransferMessage = "Place payload on fork; waiting for load sensor";
+            autoTransferState = AUTO_WAIT_FOR_LOAD;
+            break;
+
+        case AUTO_WAIT_FOR_LOAD:
+            if (loadDetected) {
+                autoTransferMessage = "Payload detected; retracting fork";
+                autoTransferState = AUTO_RETRACT_FROM_SOURCE;
+            }
+            break;
+
+        case AUTO_RETRACT_FROM_SOURCE:
+            moveToTopPosition(0.0f);
+            autoTransferState = AUTO_MOVE_TO_DESTINATION;
+            break;
+
+        case AUTO_MOVE_TO_DESTINATION:
+            autoTransferMessage = "Moving tower to destination X/Z";
+            if (startTowerMove(autoDestinationX, autoDestinationZ, "Moving to destination")) {
+                autoTransferState = AUTO_WAIT_DESTINATION_TOWER;
+            } else {
+                failAutoTransfer("Could not start destination tower move: " + towerMessage);
+            }
+            break;
+
+        case AUTO_WAIT_DESTINATION_TOWER:
+            if (towerOperationCompletedEvent) {
+                towerOperationCompletedEvent = false;
+                if (towerOperationSucceeded) {
+                    autoTransferState = AUTO_EXTEND_AT_DESTINATION;
+                } else {
+                    failAutoTransfer("Tower failed to reach destination coordinate");
+                }
+            }
+            break;
+
+        case AUTO_EXTEND_AT_DESTINATION:
+            autoTransferMessage = "Extending fork to destination Y=" + String(autoDestinationY, 1) + " mm";
+            moveToTopPosition(autoDestinationY);
+            autoTransferMessage = "Remove payload; waiting for load sensor to clear";
+            autoTransferState = AUTO_WAIT_FOR_UNLOAD;
+            break;
+
+        case AUTO_WAIT_FOR_UNLOAD:
+            if (!loadDetected) {
+                autoTransferMessage = "Payload removed; retracting fork";
+                autoTransferState = AUTO_RETRACT_FROM_DESTINATION;
+            }
+            break;
+
+        case AUTO_RETRACT_FROM_DESTINATION:
+            moveToTopPosition(0.0f);
+            autoTransferState = AUTO_COMPLETE;
+            break;
+
+        case AUTO_COMPLETE:
+            autoTransferMessage = "XYZ transfer completed";
+            autoTransferState = AUTO_IDLE;
+            break;
+
+        case AUTO_ERROR:
+            if (!asrsMaster.operationActive()) {
+                moveToTopPosition(0.0f);
+                autoTransferState = AUTO_IDLE;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void updateTowerTelemetry() {
+    if (!asrsSession.connected() || asrsMaster.operationActive() ||
+        autoTransferState != AUTO_IDLE) return;
+    if (millis() - previousTowerTelemetryMS < TOWER_TELEMETRY_INTERVAL_MS) return;
+
+    previousTowerTelemetryMS = millis();
+
+    ASRS_Coordinates coordinates;
+    if (asrsMaster.requestCoordinates(coordinates, TOWER_COMMAND_TIMEOUT_MS)) {
+        towerCoordinates = coordinates;
+        towerCoordinatesValid = true;
+        asrsSession.recordPeerActivity();
+    }
+
+    ASRS_LimitSwitches limits;
+    if (asrsMaster.requestLimitSwitches(limits, TOWER_COMMAND_TIMEOUT_MS)) {
+        towerLimits = limits;
+        towerLimitsValid = true;
+        asrsSession.recordPeerActivity();
+    }
+}
+
+void handleTowerMove() {
+    if (!server.hasArg("x") || !server.hasArg("z")) {
+        server.send(400, "text/plain", "Both X and Z targets are required");
+        return;
+    }
+    if (!asrsSession.connected()) {
+        server.send(503, "text/plain", "ASRS tower is not connected");
+        return;
+    }
+    if (asrsMaster.operationActive()) {
+        server.send(409, "text/plain", "ASRS tower is busy");
+        return;
+    }
+    if (autoTransferState != AUTO_IDLE) {
+        server.send(409, "text/plain", "Automatic XYZ transfer is active");
+        return;
+    }
+
+    const int32_t targetX = static_cast<int32_t>(server.arg("x").toInt());
+    const int32_t targetZ = static_cast<int32_t>(server.arg("z").toInt());
+    if (!startTowerMove(targetX, targetZ, "Moving X/Z")) {
+        server.send(500, "text/plain", towerMessage);
+        return;
+    }
+
+    server.send(202, "text/plain", towerMessage);
+}
+
+void handleTowerHome() {
+    const bool homeX = server.hasArg("x") && server.arg("x") == "1";
+    const bool homeZ = server.hasArg("z") && server.arg("z") == "1";
+    if (!homeX && !homeZ) {
+        server.send(400, "text/plain", "Select X, Z, or both axes to home");
+        return;
+    }
+    if (!asrsSession.connected()) {
+        server.send(503, "text/plain", "ASRS tower is not connected");
+        return;
+    }
+    if (asrsMaster.operationActive()) {
+        server.send(409, "text/plain", "ASRS tower is busy");
+        return;
+    }
+    if (autoTransferState != AUTO_IDLE) {
+        server.send(409, "text/plain", "Automatic XYZ transfer is active");
+        return;
+    }
+
+    if (!asrsMaster.sendHomingCommand(homeX, homeZ, TOWER_COMMAND_TIMEOUT_MS)) {
+        towerMessage = "Homing rejected: " + String(asrsErrorName(asrsMaster.lastError()));
+        server.send(500, "text/plain", towerMessage);
+        return;
+    }
+
+    asrsSession.recordPeerActivity();
+    towerOperation = "Homing";
+    towerMessage = "Homing accepted: X=" + String(homeX ? "yes" : "no") +
+                   ", Z=" + String(homeZ ? "yes" : "no");
+    server.send(202, "text/plain", towerMessage);
+}
+
+void handleAutoTransfer() {
+    const char* requiredArguments[] = {"sx", "sy", "sz", "dx", "dy", "dz"};
+    for (const char* argument : requiredArguments) {
+        if (!server.hasArg(argument)) {
+            server.send(400, "text/plain", "Source and destination X/Y/Z values are required");
+            return;
+        }
+    }
+
+    if (!asrsSession.connected()) {
+        server.send(503, "text/plain", "ASRS tower is not connected");
+        return;
+    }
+    if (asrsMaster.operationActive() || autoTransferState != AUTO_IDLE) {
+        server.send(409, "text/plain", "Tower or automatic transfer is busy");
+        return;
+    }
+    if (!homeConfigured) {
+        server.send(409, "text/plain", "Home the fork before starting an XYZ transfer");
+        return;
+    }
+
+    updateLoadSensor();
+    if (loadDetected) {
+        server.send(409, "text/plain", "Remove the existing payload before starting");
+        return;
+    }
+
+    const float sourceY = server.arg("sy").toFloat();
+    const float destinationY = server.arg("dy").toFloat();
+    if (sourceY < -300.0f || sourceY > 300.0f ||
+        destinationY < -300.0f || destinationY > 300.0f) {
+        server.send(400, "text/plain", "Y must be between -300 and +300 mm");
+        return;
+    }
+
+    autoSourceX = static_cast<int32_t>(server.arg("sx").toInt());
+    autoSourceY = sourceY;
+    autoSourceZ = static_cast<int32_t>(server.arg("sz").toInt());
+    autoDestinationX = static_cast<int32_t>(server.arg("dx").toInt());
+    autoDestinationY = destinationY;
+    autoDestinationZ = static_cast<int32_t>(server.arg("dz").toInt());
+    autoAbortRequested = false;
+    towerOperationCompletedEvent = false;
+    autoTransferMessage = "XYZ transfer accepted";
+    autoTransferState = AUTO_MOVE_TO_SOURCE;
+    server.send(202, "text/plain", autoTransferMessage);
+}
+
+void handleAutoAbort() {
+    if (autoTransferState == AUTO_IDLE) {
+        server.send(200, "text/plain", "No automatic transfer is active");
+        return;
+    }
+
+    // The ASRS protocol has no motion-cancel command. If an X/Z move is active,
+    // abort takes effect after the tower reports that move complete.
+    autoAbortRequested = true;
+    autoTransferMessage = asrsMaster.operationActive()
+        ? "Abort requested; waiting for current tower move to finish"
+        : "Abort requested";
+    server.send(202, "text/plain", autoTransferMessage);
+}
+
+void handleRoot() {
+
+    server.send(200, "text/html", HTML_PAGE);
+
+}
+
+
+
+void handleWiFiSetup() {
+    String page = "<h2>Fork Network</h2><p>The fork is the ESP-NOW master and does not join a router.</p>";
+    page += "<p>Connect directly to <b>Fork-WiFi-Setup</b> and open <b>http://192.168.10.1</b>.</p><p><a href='/'>Return to control page</a></p>";
+    server.send(200, "text/html", page);
+}
+
+
+
+void handleMove() {
+
+    if (autoTransferState != AUTO_IDLE) {
+
+        server.send(409, "text/plain", "Automatic XYZ transfer is active");
+
+        return;
+
+    }
+
+    if (server.hasArg("pos")) {
+
+        float targetTopMM = server.arg("pos").toFloat();
+
+        server.send(200, "text/plain", "OK");
+
+        moveToTopPosition(targetTopMM);
+
     } else {
-      fail(String("Tower error: ")+asrsErrorName(s.error));
+
+        server.send(400, "text/plain", "Bad Request");
+
     }
-    return false;
-  }
-  if(s.status==ASRS_STATUS_DONE) { towerStationary=true; return true; }
-  return false;
+
 }
 
-bool towerOperationTimedOut() {
-  if(millis()-stateStartedMs<=TOWER_OPERATION_TIMEOUT_MS) return false;
-  fail("Tower operation did not report DONE; reset required");
-  return true;
-}
 
-bool readTowerCoordinates(bool captureHome) {
-  ASRS_Coordinates measured;
-  if(!towerMaster.requestCoordinates(measured,TOWER_ACK_TIMEOUT_MS)) {
-    fail(String("Could not read tower coordinates: ")+asrsErrorName(towerMaster.lastError()));
-    return false;
-  }
-  towerSession.recordPeerActivity();
-  if(captureHome) {
-    towerSensorHome=measured;
-    towerCoordinates={0,0};
-    towerCoordinatesSynchronized=true;
-  } else {
-    if(!towerCoordinatesSynchronized) {
-      fail("Tower coordinate origin has not been captured; home the system");
-      return false;
+
+void handleStatus() {
+
+    updateLoadSensor();
+
+    bool rackConnected = rackHasReported && (millis() - lastRackUpdateMS <= RACK_OFFLINE_TIMEOUT_MS);
+
+    uint8_t rackOccupiedCount = 0;
+
+    for (uint8_t i = 0; i < 4; i++) {
+
+        if (rackSlotOccupied[i]) rackOccupiedCount++;
+
     }
-    towerCoordinates={measured.x-towerSensorHome.x,measured.z-towerSensorHome.z};
-  }
-  Serial.printf("Tower ToF raw X=%ld Z=%ld; logical X=%ld Z=%ld\n",
-      (long)measured.x,(long)measured.z,
-      (long)towerCoordinates.x,(long)towerCoordinates.z);
-  return true;
+
+    String json = "{";
+
+    json += "\"topPos\":" + String(getCurrentTopPosMM(), 2) + ",";
+
+    json += "\"secondStagePos\":" + String(currentSecondStagePosMM, 2) + ",";
+
+    json += "\"sensorDistance\":" + String(lastSensorDistanceMM) + ",";
+
+    json += "\"loadSensorValue\":" + String(loadSensorValue) + ",";
+
+    json += "\"loadDetected\":" + String(loadDetected ? "true" : "false") + ",";
+
+    json += "\"wifiConnected\":" + String((WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) ? "true" : "false") + ",";
+
+    json += "\"stationIP\":\"" + WiFi.localIP().toString() + "\",";
+
+    json += "\"apIP\":\"" + WiFi.softAPIP().toString() + "\",";
+
+    json += "\"espNowReady\":" + String(espNowReady ? "true" : "false") + ",";
+
+    json += "\"rackConnected\":" + String(rackConnected ? "true" : "false") + ",";
+
+    json += "\"rackSlot1\":" + String(rackSlotOccupied[0] ? "true" : "false") + ",";
+
+    json += "\"rackSlot2\":" + String(rackSlotOccupied[1] ? "true" : "false") + ",";
+
+    json += "\"rackSlot3\":" + String(rackSlotOccupied[2] ? "true" : "false") + ",";
+
+    json += "\"rackSlot4\":" + String(rackSlotOccupied[3] ? "true" : "false") + ",";
+
+    json += "\"rackOccupiedCount\":" + String(rackOccupiedCount) + ",";
+
+    json += "\"rackEmptyCount\":" + String(4 - rackOccupiedCount) + ",";
+
+    json += "\"towerConnected\":" + String(asrsSession.connected() ? "true" : "false") + ",";
+
+    json += "\"towerBusy\":" + String(asrsMaster.operationActive() ? "true" : "false") + ",";
+
+    json += "\"towerCoordinatesValid\":" + String(towerCoordinatesValid ? "true" : "false") + ",";
+
+    json += "\"towerX\":" + String(towerCoordinates.x) + ",";
+
+    json += "\"towerZ\":" + String(towerCoordinates.z) + ",";
+
+    json += "\"towerLimitXMin\":" + String(towerLimits.xMinimum ? "true" : "false") + ",";
+
+    json += "\"towerLimitXMax\":" + String(towerLimits.xMaximum ? "true" : "false") + ",";
+
+    json += "\"towerLimitZMin\":" + String(towerLimits.zMinimum ? "true" : "false") + ",";
+
+    json += "\"towerLimitZMax\":" + String(towerLimits.zMaximum ? "true" : "false") + ",";
+
+    json += "\"towerOperation\":\"" + towerOperation + "\",";
+
+    json += "\"towerMessage\":\"" + towerMessage + "\",";
+
+    json += "\"autoTransferActive\":" + String(autoTransferState != AUTO_IDLE ? "true" : "false") + ",";
+
+    json += "\"autoTransferMessage\":\"" + autoTransferMessage + "\",";
+
+    json += "\"homing\":" + String(isHoming ? "true" : "false") + ",";
+
+    json += "\"homeConfigured\":" + String(homeConfigured ? "true" : "false") + ",";
+
+    json += "\"moving\":" + String(isMoving ? "true" : "false");
+
+    json += "}";
+
+    server.send(200, "application/json", json);
+
 }
 
-bool sendTowerToAbsolute(int32_t targetX, int32_t targetZ) {
-  const int32_t commandX=TOWER_COMMANDS_ARE_RELATIVE
-      ? targetX-towerCoordinates.x : targetX+towerSensorHome.x;
-  const int32_t commandZ=TOWER_COMMANDS_ARE_RELATIVE
-      ? targetZ-towerCoordinates.z : targetZ+towerSensorHome.z;
-  Serial.printf("Tower absolute target X=%ld Z=%ld; command X=%ld Z=%ld\n",
-      (long)targetX,(long)targetZ,(long)commandX,(long)commandZ);
-  return towerMaster.sendTravelCommand(commandX,commandZ,TOWER_ACK_TIMEOUT_MS);
-}
 
-bool beginHome() {
-  if(state!=READY && state!=ERROR_STATE && state!=SUCCESS && state!=BOOT) return false;
-  if(towerMaster.operationActive()) return false;
-  operation=OP_HOME; errorMessage=""; forkHomed=false; towerHomed=false;
-  towerCoordinatesSynchronized=false; towerRecoveryRequired=false; state=HOME_Y_SEARCH;
-  return true;
-}
 
-bool beginTowerRecovery() {
-  if(state!=ERROR_STATE || !towerRecoveryRequired ||
-     towerMaster.operationActive() || !towerSession.connected() ||
-     !forkHomed || yMoving) return false;
+void handleRackUpdate() {
 
-  operation=OP_HOME;
-  errorMessage="";
-  statusMessage="Recovering from tower limit stop";
+    const char* names[4] = {"slot1", "slot2", "slot3", "slot4"};
 
-  if(fabs(currentY)>Y_RETRACTED_TOLERANCE_MM) {
-    if(!startYMove(0)) return false;
-    state=RECOVER_RETRACT_Y;
-  } else {
-    state=RECOVER_TOWER_START;
-  }
-  return true;
-}
+    for (uint8_t i = 0; i < 4; i++) {
 
-void updateOperation() {
-  if(state==HOME_Y_SEARCH || (state==BOOT && !forkHomed)) { updateYHoming(); return; }
-  if(state==HOME_Y_RETRACT && !yMoving) { state=HOME_TOWER_START; }
-  if(state==HOME_TOWER_START) {
-    if(!towerSession.connected()) return;
-    Serial.printf("Sending tower homing command; ACK timeout=%lu ms\n",(unsigned long)TOWER_ACK_TIMEOUT_MS);
-    if(towerMaster.sendHomingCommand(true,true,TOWER_ACK_TIMEOUT_MS)) { towerSession.recordPeerActivity(); towerStationary=false; stateStartedMs=millis(); Serial.println("Tower homing accepted"); state=HOME_TOWER_WAIT; }
-    else { Serial.printf("Tower homing ACK failed: %s\n",asrsErrorName(towerMaster.lastError())); fail(String("Tower homing rejected: ")+asrsErrorName(towerMaster.lastError())); }
-  }
-  if(state==HOME_TOWER_WAIT && waitTowerTerminal()) {
-    if(!readTowerCoordinates(true)) return;
-    towerHomed=true; operation=OP_NONE; state=READY; statusMessage="System homed and ready";
-  }
-  if(state==HOME_TOWER_WAIT && towerOperationTimedOut()) return;
-  if(state==VALIDATE) {
-    if(!forkHomed||!towerHomed) { fail("System must be homed"); return; }
-    if(activeTargetUsesRack && !rackOnline) { fail("Rack status is offline"); return; }
-    if(activeTargetUsesRack && operation==OP_PICK && !rackOccupied[selectedSlot]) { fail("Cannot pick from an empty slot"); return; }
-    if(activeTargetUsesRack && operation==OP_PLACE && rackOccupied[selectedSlot]) { fail("Cannot place into an occupied slot"); return; }
-    if(operation==OP_PICK && loadDetected) { fail("Fork already detects a load"); return; }
-    if(operation==OP_PLACE && !loadDetected) { fail("No load detected for place operation"); return; }
-    if(fabs(currentY)>Y_RETRACTED_TOLERANCE_MM) {
-      if(!startYMove(0)) { fail("Could not retract fork before tower travel"); return; }
-      state=PREPARE_RETRACT_Y;
-    } else {
-      state=MOVE_TOWER_START;
+        if (!server.hasArg(names[i])) {
+
+            server.send(400, "text/plain", "Missing slot value");
+
+            return;
+
+        }
+
     }
-  }
-  if(state==PREPARE_RETRACT_Y && !yMoving) { currentY=0; state=MOVE_TOWER_START; }
-  if(state==MOVE_TOWER_START) {
-    if(sendTowerToAbsolute(activeTarget.x,activeTarget.z)) { towerSession.recordPeerActivity(); towerStationary=false; stateStartedMs=millis(); state=MOVE_TOWER_WAIT; }
-    else fail(String("Tower move rejected: ")+asrsErrorName(towerMaster.lastError()));
-  }
-  if(state==MOVE_TOWER_WAIT && waitTowerTerminal()) {
-    if(!readTowerCoordinates(false)) return;
-    if(!startYMove(activeTarget.y)) fail("Invalid or unavailable Y movement"); else state=EXTEND_Y;
-  }
-  if(state==MOVE_TOWER_WAIT && towerOperationTimedOut()) return;
-  if(state==EXTEND_Y && !yMoving) {
-    if(operation==OP_POSITION) {
-      operation=OP_NONE;
-      statusMessage="Independent position reached";
-      state=SUCCESS;
-      return;
+
+    for (uint8_t i = 0; i < 4; i++) {
+
+        rackSlotOccupied[i] = server.arg(names[i]) == "1";
+
     }
-    transferStartZ=towerCoordinates.z; transferCurrentZ=transferStartZ; state=TRANSFER_CHECK;
-  }
-  if(state==TRANSFER_CHECK) {
-    bool acquired=operation==OP_PICK ? stableLoad(true) : stableLoad(false);
-    if(acquired) { if(!startYMove(0)) fail("Could not retract fork"); else state=RETRACT_Y; return; }
-    int32_t travelled=abs(transferCurrentZ-transferStartZ);
-    if(travelled>=MAX_TRANSFER_Z_MM) { fail(operation==OP_PICK?"Load not detected within pick lift":"Load not released within place descent"); return; }
-    state=TRANSFER_MOVE_START;
-  }
-  if(state==TRANSFER_MOVE_START) {
-    transferCurrentZ += operation==OP_PICK ? TRANSFER_Z_STEP_MM : -TRANSFER_Z_STEP_MM;
-    if(sendTowerToAbsolute(towerCoordinates.x,transferCurrentZ)) { towerSession.recordPeerActivity(); towerStationary=false; stateStartedMs=millis(); state=TRANSFER_MOVE_WAIT; }
-    else fail("Tower transfer step rejected");
-  }
-  if(state==TRANSFER_MOVE_WAIT && waitTowerTerminal()) {
-    if(!readTowerCoordinates(false)) return;
-    transferCurrentZ=towerCoordinates.z;
-    state=TRANSFER_CHECK;
-  }
-  if(state==TRANSFER_MOVE_WAIT && towerOperationTimedOut()) return;
-  if(state==RETRACT_Y && !yMoving) {
-    if(!activeTargetUsesRack) {
-      statusMessage=operation==OP_PICK?"Independent pick completed":"Independent place completed";
-      operation=OP_NONE;
-      state=SUCCESS;
-    } else {
-      stateStartedMs=millis(); requestRackStatus(); state=VERIFY_RACK;
-    }
-  }
-  if(state==VERIFY_RACK) {
-    bool expected=operation==OP_PLACE;
-    if(rackOnline && rackOccupied[selectedSlot]==expected) { statusMessage=operation==OP_PICK?"Pick completed":"Place completed"; operation=OP_NONE; state=SUCCESS; }
-    else if(millis()-stateStartedMs>5000) fail("Rack did not confirm occupancy change");
-  }
-  if(state==RECOVER_RETRACT_Y && !yMoving) {
-    currentY=0;
-    state=RECOVER_TOWER_START;
-  }
-  if(state==RECOVER_TOWER_START) {
-    if(!towerSession.connected()) return;
-    Serial.printf("Sending recovery tower homing command; ACK timeout=%lu ms\n",(unsigned long)TOWER_ACK_TIMEOUT_MS);
-    if(towerMaster.sendHomingCommand(true,true,TOWER_ACK_TIMEOUT_MS)) {
-      towerSession.recordPeerActivity();
-      towerStationary=false;
-      stateStartedMs=millis();
-      state=RECOVER_TOWER_WAIT;
-    } else {
-      fail(String("Tower recovery homing rejected: ")+asrsErrorName(towerMaster.lastError()));
-    }
-  }
-  if(state==RECOVER_TOWER_WAIT && waitTowerTerminal()) {
-    if(!readTowerCoordinates(true)) return;
-    towerHomed=true;
-    towerStationary=true;
-    towerRecoveryRequired=false;
-    operation=OP_NONE;
-    errorMessage="";
-    statusMessage="Tower recovered and system ready";
-    state=READY;
-  }
-  if(state==RECOVER_TOWER_WAIT && towerOperationTimedOut()) return;
-  if(state==STOPPING) finishStop();
+
+    lastRackUpdateMS = millis();
+
+    rackHasReported = true;
+
+    Serial.print("Rack update received from ");
+
+    Serial.println(server.client().remoteIP());
+
+    server.send(200, "text/plain", "OK");
+
 }
 
-void sendStatus() {
-  // A successful status poll is itself proof that the control page is present.
-  // This also avoids a false stop if the separate heartbeat request is delayed.
-  lastBrowserHeartbeat=millis();
-  String j="{\"state\":\""+String(stateName())+"\",\"message\":\""+statusMessage+"\",\"error\":\""+errorMessage+"\"";
-  j+=",\"x\":"+String(towerCoordinates.x)+",\"y\":"+String(currentY,1)+",\"z\":"+String(towerCoordinates.z);
-  j+=",\"load\":"+String(loadDetected?"true":"false")+",\"tower\":"+String(towerSession.connected()?"true":"false")+",\"rack\":"+String(rackOnline?"true":"false");
-  j+=",\"recoverable\":"+String((state==ERROR_STATE&&towerRecoveryRequired&&towerStationary&&!towerMaster.operationActive()&&towerSession.connected()&&forkHomed&&!yMoving)?"true":"false");
-  j+=",\"slots\":["; for(uint8_t i=0;i<4;i++){if(i)j+=",";j+=rackOccupied[i]?"true":"false";} j+="]";
-  j+=",\"locations\":["; for(uint8_t i=0;i<4;i++){if(i)j+=",";j+="{\"name\":\""+String(locations[i].name)+"\",\"x\":"+locations[i].x+",\"y\":"+locations[i].y+",\"z\":"+locations[i].z+"}";} j+="]}";
-  server.send(200,"application/json",j);
+
+
+void handleSensorHome() {
+
+    if (autoTransferState != AUTO_IDLE) {
+
+        server.send(409, "text/plain", "Automatic XYZ transfer is active");
+
+        return;
+
+    }
+
+    bool homed = runSensorHoming();
+
+    server.send(homed ? 200 : 500, "text/plain", lastHomingMessage);
+
 }
 
-void loadLocations() {
-  preferences.begin("asrs_locations",false);
-  for(uint8_t i=0;i<4;i++){String key="loc"+String(i);preferences.getBytes(key.c_str(),&locations[i],sizeof(SavedLocation));}
-}
 
-void setupWeb() {
-  WiFi.mode(WIFI_AP_STA); WiFi.setSleep(false); WiFi.softAP(AP_SSID,AP_PASSWORD,ESPNOW_CHANNEL); loadLocations();
-  server.on("/",[](){server.send_P(200,"text/html",PAGE);}); server.on("/api/status",HTTP_GET,sendStatus);
-  server.on("/api/heartbeat",HTTP_POST,[](){lastBrowserHeartbeat=millis();server.send(200,"text/plain","OK");});
-  server.on("/api/home",HTTP_POST,[](){if(beginHome())server.send(202,"text/plain","Homing requested");else server.send(409,"text/plain","Homing already active or system busy");});
-  server.on("/api/recover",HTTP_POST,[](){if(beginTowerRecovery())server.send(202,"text/plain","Tower recovery started");else server.send(409,"text/plain","Tower recovery is unavailable");});
-  server.on("/api/stop",HTTP_POST,[](){
-    if(requestStop("Stopped by operator")) server.send(202,"text/plain","Stopping");
-    else server.send(409,"text/plain","No active operation to stop");
-  });
-  auto operationHandler=[](OperationType requested){
-    if(state!=READY&&state!=SUCCESS){server.send(409,"text/plain","System is not ready");return;}
-    int slot=server.arg("slot").toInt();if(slot<0||slot>3){server.send(422,"text/plain","Invalid slot");return;}
-    selectedSlot=slot;activeTarget=locations[slot];activeTargetUsesRack=true;operation=requested;errorMessage="";statusMessage=requested==OP_PICK?"Rack pick started":"Rack place started";lastBrowserHeartbeat=millis();state=VALIDATE;stateStartedMs=millis();server.send(202,"text/plain","Accepted");
-  };
-  server.on("/api/pick",HTTP_POST,[operationHandler](){operationHandler(OP_PICK);});
-  server.on("/api/place",HTTP_POST,[operationHandler](){operationHandler(OP_PLACE);});
-  server.on("/api/manual",HTTP_POST,[](){
-    if(state!=READY&&state!=SUCCESS){server.send(409,"text/plain","System is not ready");return;}
-    if(!server.hasArg("type")||!server.hasArg("x")||!server.hasArg("y")||!server.hasArg("z")){server.send(400,"text/plain","Missing type or coordinate");return;}
-    int32_t targetX=server.arg("x").toInt(),targetY=server.arg("y").toInt(),targetZ=server.arg("z").toInt();
-    if(targetX<500||targetX>2500||targetY<-300||targetY>300||targetZ<400||targetZ>1600){server.send(422,"text/plain","Coordinate outside configured limits");return;}
-    String type=server.arg("type");
-    if(type=="pick")operation=OP_PICK;else if(type=="place")operation=OP_PLACE;else if(type=="move")operation=OP_POSITION;else{server.send(422,"text/plain","Unknown manual operation");return;}
-    strncpy(activeTarget.name,"Manual",sizeof(activeTarget.name));activeTarget.name[sizeof(activeTarget.name)-1]='\0';activeTarget.x=targetX;activeTarget.y=targetY;activeTarget.z=targetZ;
-    activeTargetUsesRack=false;errorMessage="";statusMessage=type+" to independent coordinate started";lastBrowserHeartbeat=millis();state=VALIDATE;stateStartedMs=millis();server.send(202,"text/plain","Independent coordinate operation accepted");
-  });
-  server.on("/api/location",HTTP_POST,[](){int i=server.arg("slot").toInt();int x=server.arg("x").toInt(),y=server.arg("y").toInt(),z=server.arg("z").toInt();
-    if(i<0||i>3||x<500||x>2500||y<-300||y>300||z<400||z>1600){server.send(422,"text/plain","Coordinate outside configured limits");return;}
-    server.arg("name").substring(0,19).toCharArray(locations[i].name,sizeof(locations[i].name));locations[i].x=x;locations[i].y=y;locations[i].z=z;
-    String key="loc"+String(i);preferences.putBytes(key.c_str(),&locations[i],sizeof(SavedLocation));server.send(200,"text/plain","Saved");});
-  server.begin(); Serial.print("Web UI: http://"); Serial.println(WiFi.softAPIP());
-}
+
+// =====================================================
+
+// SETUP & LOOP
+
+// =====================================================
 
 void setup() {
-  Serial.begin(115200); pinMode(STEP_PIN,OUTPUT);pinMode(DIR_PIN,OUTPUT);pinMode(ENABLE_PIN,OUTPUT);pinMode(LOAD_SENSOR_PIN,INPUT);
-  digitalWrite(STEP_PIN,LOW);digitalWrite(ENABLE_PIN,LOW);analogReadResolution(12);Wire.begin(I2C_SDA_PIN,I2C_SCL_PIN);
-  ASRS_Comm_ESPNow::setRawReceiveHandler(rawRackReceiver);
-  setupWeb();updateLoad();
-  if(!towerSession.begin(ESPNOW_CHANNEL,PAIR_TIMEOUT_MS,&Serial)) Serial.println("Tower not paired yet; session will continue recovery.");
-  towerSession.setRepairingTimeout(REPAIR_ATTEMPT_TIMEOUT_MS);
-  towerSession.setHeartbeatInterval(0);
-  towerSession.setLinkTimeout(0);
-  WiFi.mode(WIFI_AP_STA);WiFi.setSleep(false);
-  if(!WiFi.softAP(AP_SSID,AP_PASSWORD,ESPNOW_CHANNEL)) Serial.println("ERROR: Fork Wi-Fi AP failed after ESP-NOW startup");
-  else {Serial.print("Fork Wi-Fi ready: ");Serial.println(WiFi.softAPIP());}
-  esp_now_peer_info_t peer={};memcpy(peer.peer_addr,BROADCAST_MAC,6);peer.channel=ESPNOW_CHANNEL;peer.encrypt=false;if(!esp_now_is_peer_exist(BROADCAST_MAC))esp_now_add_peer(&peer);
-  beginHome();
+
+    Serial.begin(115200);
+
+
+
+    pinMode(EN_PIN, OUTPUT);
+
+    pinMode(DIR_PIN, OUTPUT);
+
+    pinMode(STEP_PIN, OUTPUT);
+
+    pinMode(LOAD_SENSOR_PIN, INPUT);
+
+    analogReadResolution(12);
+
+
+
+    digitalWrite(STEP_PIN, LOW);
+
+    digitalWrite(DIR_PIN, LOW);
+
+    digitalWrite(EN_PIN, LOW); // Enable motor driver
+
+
+
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+    sensorReady = distanceSensor.begin();
+
+    updateLoadSensor();
+
+
+
+    // One channel and one receive callback are shared by the rack and tower.
+    espNowReady = startIntegratedEspNow();
+
+    // Start the control AP after ESP-NOW initialization, retaining STA mode.
+    startForkSetupAccessPoint();
+
+    startForkMDNS();
+
+    IPAddress myIP = WiFi.softAPIP();
+
+
+
+    Serial.println("\n--- Wi-Fi Control Ready ---");
+
+    Serial.print("VL53L0X sensor: ");
+
+    Serial.println(sensorReady ? "ready" : "not detected");
+
+    Serial.println("For Wi-Fi setup connect to: Fork-WiFi-Setup");
+
+    Serial.print("Setup page: http://");
+
+    Serial.println(myIP);
+
+
+
+    // Register Web Server URLs
+
+    server.on("/", handleRoot);
+
+    server.on("/wifi", HTTP_GET, handleWiFiSetup);
+
+    server.on("/move", handleMove);
+
+    server.on("/status", handleStatus);
+
+    server.on("/sensorhome", handleSensorHome);
+
+    server.on("/tower-move", HTTP_GET, handleTowerMove);
+
+    server.on("/tower-home", HTTP_GET, handleTowerHome);
+
+    server.on("/auto-transfer", HTTP_GET, handleAutoTransfer);
+
+    server.on("/auto-abort", HTTP_GET, handleAutoAbort);
+
+    server.on("/rack-update", HTTP_POST, handleRackUpdate);
+
+    server.begin();
+
 }
 
+
+
 void loop() {
-  server.handleClient();
-  if(towerSession.connected()||millis()-lastTowerSessionUpdateMs>=TOWER_SESSION_UPDATE_MS){lastTowerSessionUpdateMs=millis();towerSession.update();}
-  processRackPacket(); updateYMotor();
-  if(millis()-lastLoadUpdateMs>=LOAD_UPDATE_INTERVAL_MS){lastLoadUpdateMs=millis();updateLoad();}
-  if(millis()-lastRackRequestMs>=RACK_REQUEST_MS){lastRackRequestMs=millis();requestRackStatus();}
-  if(rackOnline&&millis()-lastRackPacketMs>RACK_OFFLINE_MS)rackOnline=false;
-  bool active=state!=READY&&state!=SUCCESS&&state!=ERROR_STATE&&operation!=OP_HOME;
-  if(active&&lastBrowserHeartbeat!=0&&millis()-lastBrowserHeartbeat>WEB_LEASE_MS)
-    requestStop("Stopped because the control webpage disconnected");
-  updateOperation();
-  monitorTowerAfterStop();
-  delay(1);
-}
+
+    server.handleClient();
+
+    if (towerSessionStarted &&
+        (asrsSession.connected() ||
+         millis() - previousTowerSessionUpdateMS >= TOWER_PAIRING_RETRY_INTERVAL_MS)) {
+        previousTowerSessionUpdateMS = millis();
+        asrsSession.update();
+    }
+
+    if (towerSessionStarted) {
+        updateTowerOperation();
+        updateAutoTransfer();
+        updateTowerTelemetry();
+
+        if (!asrsSession.connected() && !asrsMaster.operationActive()) {
+            towerMessage = "Pairing with ASRS tower on channel 1";
+        }
+    }
+
+    if (millis() - previousEspNowRequestMS >= ESP_NOW_REQUEST_INTERVAL_MS) {
+        previousEspNowRequestMS = millis();
+        requestRackStatusNow();
+    }
+
+    if (millis() - previousAPHealthCheckMS >= AP_HEALTH_CHECK_INTERVAL_MS) {
+
+        previousAPHealthCheckMS = millis();
+
+        bool apInvalid = (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) ||
+
+                         WiFi.softAPIP() == IPAddress(0, 0, 0, 0) ||
+
+                         WiFi.softAPSSID() != String(SETUP_AP_SSID);
+
+        Serial.print("AP uptime(s): ");
+
+        Serial.print(millis() / 1000);
+
+        Serial.print(" | clients: ");
+
+        Serial.print(WiFi.softAPgetStationNum());
+
+        Serial.print(" | free heap: ");
+
+        Serial.println(ESP.getFreeHeap());
+
+        if (apInvalid) {
+
+            Serial.println("Fork Wi-Fi stopped; attempting recovery...");
+
+            WiFi.softAPdisconnect(true);
+
+            startForkSetupAccessPoint();
+
+        }
+
+        startForkMDNS();
+
+    }
+
+} 
