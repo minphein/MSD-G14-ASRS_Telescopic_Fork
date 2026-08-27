@@ -7,6 +7,8 @@
 #include <ASRSCommunication.h>
 #include <ASRS_Master.h>
 #include <ASRS_Comm_ESPNow.h>
+
+#include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 
@@ -168,22 +170,27 @@ const unsigned long TOWER_PAIRING_RETRY_INTERVAL_MS = 500;
 // initializes the transport without blocking setup on the radio's old channel.
 const uint32_t TOWER_INITIAL_PAIRING_TIMEOUT_MS = 0;
 const uint32_t TOWER_COMMAND_TIMEOUT_MS = 1500;
+const int32_t AUTO_Z_STEP_MM = 2;
+const int32_t AUTO_Z_MAX_SEARCH_MM = 100;
+const unsigned long AUTO_Z_STEP_PAUSE_MS = 150;
 
 // XYZ assignment workflow from the tower integration documentation:
 // X/Z are absolute tower coordinates in millimetres and Y is the fork
-// extension coordinate. The operator places the payload on the fork after it
-// reaches the requested pickup coordinate.
+// extension coordinate. After Y extends, Z probes upward/downward in small
+// steps and the fork pressure sensor identifies pickup and release.
 enum AutoTransferState : uint8_t {
     AUTO_IDLE,
     AUTO_MOVE_TO_SOURCE,
     AUTO_WAIT_SOURCE_TOWER,
     AUTO_EXTEND_AT_SOURCE,
-    AUTO_WAIT_FOR_LOAD,
+    AUTO_RAISE_FOR_LOAD,
+    AUTO_WAIT_RAISE_STEP,
     AUTO_RETRACT_FROM_SOURCE,
     AUTO_MOVE_TO_DESTINATION,
     AUTO_WAIT_DESTINATION_TOWER,
     AUTO_EXTEND_AT_DESTINATION,
-    AUTO_WAIT_FOR_UNLOAD,
+    AUTO_LOWER_FOR_UNLOAD,
+    AUTO_WAIT_LOWER_STEP,
     AUTO_RETRACT_FROM_DESTINATION,
     AUTO_COMPLETE,
     AUTO_ERROR
@@ -196,8 +203,21 @@ int32_t autoSourceZ = 0;
 int32_t autoDestinationX = 0;
 float autoDestinationY = 0.0f;
 int32_t autoDestinationZ = 0;
+int32_t autoWorkingZ = 0;
+unsigned long autoPreviousZStepMS = 0;
 String autoTransferMessage = "Idle";
 bool autoAbortRequested = false;
+
+struct SlotCoordinate {
+    int32_t x;
+    float y;
+    int32_t z;
+    bool configured;
+};
+
+SlotCoordinate slotCoordinates[4] = {};
+uint8_t autoSourceSlot = 0;       // 1-4 for slot transfers; 0 for free XYZ.
+uint8_t autoDestinationSlot = 0;
 
 Adafruit_VL53L0X distanceSensor = Adafruit_VL53L0X();
 
@@ -225,6 +245,53 @@ void updateLoadSensor() {
 
     }
 
+}
+
+bool rackIsConnected() {
+    return rackHasReported &&
+           millis() - lastRackUpdateMS <= RACK_OFFLINE_TIMEOUT_MS;
+}
+
+void loadSavedSlotCoordinates() {
+    Preferences preferences;
+    if (!preferences.begin("fork_slots", true)) {
+        Serial.println("WARNING: Could not open saved slot coordinates");
+        return;
+    }
+
+    char key[8];
+    for (uint8_t i = 0; i < 4; i++) {
+        snprintf(key, sizeof(key), "s%ux", i + 1);
+        slotCoordinates[i].x = preferences.getInt(key, 0);
+        snprintf(key, sizeof(key), "s%uy", i + 1);
+        slotCoordinates[i].y = preferences.getFloat(key, 0.0f);
+        snprintf(key, sizeof(key), "s%uz", i + 1);
+        slotCoordinates[i].z = preferences.getInt(key, 0);
+        snprintf(key, sizeof(key), "s%uok", i + 1);
+        slotCoordinates[i].configured = preferences.getBool(key, false);
+    }
+    preferences.end();
+}
+
+bool saveSlotCoordinate(uint8_t slotIndex, int32_t x, float y, int32_t z) {
+    if (slotIndex >= 4) return false;
+
+    Preferences preferences;
+    if (!preferences.begin("fork_slots", false)) return false;
+
+    char key[8];
+    snprintf(key, sizeof(key), "s%ux", slotIndex + 1);
+    preferences.putInt(key, x);
+    snprintf(key, sizeof(key), "s%uy", slotIndex + 1);
+    preferences.putFloat(key, y);
+    snprintf(key, sizeof(key), "s%uz", slotIndex + 1);
+    preferences.putInt(key, z);
+    snprintf(key, sizeof(key), "s%uok", slotIndex + 1);
+    preferences.putBool(key, true);
+    preferences.end();
+
+    slotCoordinates[slotIndex] = {x, y, z, true};
+    return true;
 }
 
 // =====================================================
@@ -719,6 +786,12 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
         .btn-abort { background-color: #b91c1c; color: white; }
 
+        .slot-coordinate-row { display: grid; grid-template-columns: 42px repeat(3, 1fr); gap: 5px; margin: 7px 0; align-items: center; }
+
+        .slot-coordinate-row input { width: 100% !important; padding: 7px; font-size: 0.9rem; }
+
+        select { padding: 9px; margin: 5px; font-size: 1rem; }
+
     </style>
 
 </head>
@@ -825,6 +898,8 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
             <div class="sub-text">Absolute coordinates in mm. Y is fork extension (-300 to +300).</div>
 
+            <div class="sub-text">After Y extends, Z rises for pickup and lowers for placement until the pressure sensor changes.</div>
+
             <b>Pickup coordinate</b>
 
             <div class="xyz-grid">
@@ -859,6 +934,44 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
         </div>
 
+        <div class="tower-panel">
+
+            <h3>Saved Rack Slots</h3>
+
+            <div class="sub-text">Enter each slot's absolute X/Y/Z coordinate in mm, then save it to ESP32 flash.</div>
+
+            <div class="slot-coordinate-row"><b>S1</b><input id="s1x" placeholder="X"><input id="s1y" placeholder="Y"><input id="s1z" placeholder="Z"></div>
+
+            <button class="btn-preset" onclick="saveSlot(1)">SAVE 1</button>
+
+            <div class="slot-coordinate-row"><b>S2</b><input id="s2x" placeholder="X"><input id="s2y" placeholder="Y"><input id="s2z" placeholder="Z"></div>
+
+            <button class="btn-preset" onclick="saveSlot(2)">SAVE 2</button>
+
+            <div class="slot-coordinate-row"><b>S3</b><input id="s3x" placeholder="X"><input id="s3y" placeholder="Y"><input id="s3z" placeholder="Z"></div>
+
+            <button class="btn-preset" onclick="saveSlot(3)">SAVE 3</button>
+
+            <div class="slot-coordinate-row"><b>S4</b><input id="s4x" placeholder="X"><input id="s4y" placeholder="Y"><input id="s4z" placeholder="Z"></div>
+
+            <button class="btn-preset" onclick="saveSlot(4)">SAVE 4</button>
+
+            <hr>
+
+            <label>Pick slot</label>
+
+            <select id="pickSlot"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+
+            <label>Place slot</label>
+
+            <select id="placeSlot"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+
+            <button class="btn-move" onclick="startSlotTransfer()">TRANSFER BETWEEN SLOTS</button>
+
+            <div class="sub-text" id="slotSaveMessage">Configure all slots before use.</div>
+
+        </div>
+
 
 
         <div class="status" id="statusText">Ready</div>
@@ -868,6 +981,8 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
 
     <script>
+
+        let slotCoordinatesLoaded = false;
 
         function updateStatus() {
 
@@ -910,6 +1025,24 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
                     document.getElementById('autoState').classList.toggle('online', data.autoTransferActive);
 
                     document.getElementById('autoMessage').innerText = data.autoTransferMessage;
+
+                    if (!slotCoordinatesLoaded) {
+
+                        for (let i = 1; i <= 4; i++) {
+
+                            const saved = data['slot' + i + 'Configured'];
+
+                            document.getElementById('s' + i + 'x').value = saved ? data['slot' + i + 'X'] : '';
+
+                            document.getElementById('s' + i + 'y').value = saved ? data['slot' + i + 'Y'] : '';
+
+                            document.getElementById('s' + i + 'z').value = saved ? data['slot' + i + 'Z'] : '';
+
+                        }
+
+                        slotCoordinatesLoaded = true;
+
+                    }
 
                     if (data.homing) {
 
@@ -1077,6 +1210,44 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
         }
 
+        function saveSlot(slot) {
+
+            const x = document.getElementById('s' + slot + 'x').value;
+
+            const y = document.getElementById('s' + slot + 'y').value;
+
+            const z = document.getElementById('s' + slot + 'z').value;
+
+            if (x === '' || y === '' || z === '') return;
+
+            fetch('/slot-save?slot=' + slot + '&x=' + encodeURIComponent(x) +
+
+                  '&y=' + encodeURIComponent(y) + '&z=' + encodeURIComponent(z))
+
+                .then(async r => ({ ok: r.ok, message: await r.text() }))
+
+                .then(result => {
+
+                    document.getElementById('slotSaveMessage').innerText = result.message;
+
+                    slotCoordinatesLoaded = false;
+
+                    return updateStatus();
+
+                });
+
+        }
+
+        function startSlotTransfer() {
+
+            const source = document.getElementById('pickSlot').value;
+
+            const destination = document.getElementById('placeSlot').value;
+
+            towerRequest('/slot-transfer?source=' + source + '&destination=' + destination);
+
+        }
+
 
 
         function sendMove() {
@@ -1236,6 +1407,16 @@ void updateAutoTransfer() {
 
     switch (autoTransferState) {
         case AUTO_MOVE_TO_SOURCE:
+            if (autoSourceSlot != 0) {
+                if (!rackIsConnected()) {
+                    failAutoTransfer("Slot transfer stopped: rack is offline");
+                    break;
+                }
+                if (!rackSlotOccupied[autoSourceSlot - 1]) {
+                    failAutoTransfer("Slot transfer stopped: pickup slot is empty");
+                    break;
+                }
+            }
             autoTransferMessage = "Moving tower to pickup X/Z";
             if (startTowerMove(autoSourceX, autoSourceZ, "Moving to pickup")) {
                 autoTransferState = AUTO_WAIT_SOURCE_TOWER;
@@ -1248,6 +1429,7 @@ void updateAutoTransfer() {
             if (towerOperationCompletedEvent) {
                 towerOperationCompletedEvent = false;
                 if (towerOperationSucceeded) {
+                    autoWorkingZ = autoSourceZ;
                     autoTransferState = AUTO_EXTEND_AT_SOURCE;
                 } else {
                     failAutoTransfer("Tower failed to reach pickup coordinate");
@@ -1256,16 +1438,54 @@ void updateAutoTransfer() {
             break;
 
         case AUTO_EXTEND_AT_SOURCE:
+            if (autoSourceSlot != 0 &&
+                (!rackIsConnected() || !rackSlotOccupied[autoSourceSlot - 1])) {
+                failAutoTransfer("Pickup cancelled: source slot became empty or rack went offline");
+                break;
+            }
             autoTransferMessage = "Extending fork to pickup Y=" + String(autoSourceY, 1) + " mm";
             moveToTopPosition(autoSourceY);
-            autoTransferMessage = "Place payload on fork; waiting for load sensor";
-            autoTransferState = AUTO_WAIT_FOR_LOAD;
+            autoTransferMessage = "Raising Z slowly until payload is detected";
+            autoPreviousZStepMS = 0;
+            autoTransferState = AUTO_RAISE_FOR_LOAD;
             break;
 
-        case AUTO_WAIT_FOR_LOAD:
+        case AUTO_RAISE_FOR_LOAD:
             if (loadDetected) {
                 autoTransferMessage = "Payload detected; retracting fork";
                 autoTransferState = AUTO_RETRACT_FROM_SOURCE;
+                break;
+            }
+            if (autoWorkingZ - autoSourceZ >= AUTO_Z_MAX_SEARCH_MM) {
+                failAutoTransfer("Pickup stopped: no load detected within Z search limit");
+                break;
+            }
+            if (autoPreviousZStepMS != 0 &&
+                millis() - autoPreviousZStepMS < AUTO_Z_STEP_PAUSE_MS) break;
+
+            autoWorkingZ += AUTO_Z_STEP_MM;
+            autoTransferMessage = "Pickup Z=" + String(autoWorkingZ) +
+                                  " mm; pressure=" + String(loadSensorValue);
+            if (startTowerMove(autoSourceX, autoWorkingZ, "Pickup Z step")) {
+                autoPreviousZStepMS = millis();
+                autoTransferState = AUTO_WAIT_RAISE_STEP;
+            } else {
+                failAutoTransfer("Could not raise Z during pickup: " + towerMessage);
+            }
+            break;
+
+        case AUTO_WAIT_RAISE_STEP:
+            if (towerOperationCompletedEvent) {
+                towerOperationCompletedEvent = false;
+                if (!towerOperationSucceeded) {
+                    failAutoTransfer("Tower Z step failed during pickup");
+                } else if (loadDetected) {
+                    autoTransferMessage = "Payload detected; retracting fork";
+                    autoTransferState = AUTO_RETRACT_FROM_SOURCE;
+                } else {
+                    autoPreviousZStepMS = millis();
+                    autoTransferState = AUTO_RAISE_FOR_LOAD;
+                }
             }
             break;
 
@@ -1275,6 +1495,16 @@ void updateAutoTransfer() {
             break;
 
         case AUTO_MOVE_TO_DESTINATION:
+            if (autoDestinationSlot != 0) {
+                if (!rackIsConnected()) {
+                    failAutoTransfer("Slot transfer stopped: rack is offline");
+                    break;
+                }
+                if (rackSlotOccupied[autoDestinationSlot - 1]) {
+                    failAutoTransfer("Slot transfer stopped: destination slot is occupied");
+                    break;
+                }
+            }
             autoTransferMessage = "Moving tower to destination X/Z";
             if (startTowerMove(autoDestinationX, autoDestinationZ, "Moving to destination")) {
                 autoTransferState = AUTO_WAIT_DESTINATION_TOWER;
@@ -1287,6 +1517,7 @@ void updateAutoTransfer() {
             if (towerOperationCompletedEvent) {
                 towerOperationCompletedEvent = false;
                 if (towerOperationSucceeded) {
+                    autoWorkingZ = autoDestinationZ;
                     autoTransferState = AUTO_EXTEND_AT_DESTINATION;
                 } else {
                     failAutoTransfer("Tower failed to reach destination coordinate");
@@ -1295,16 +1526,54 @@ void updateAutoTransfer() {
             break;
 
         case AUTO_EXTEND_AT_DESTINATION:
+            if (autoDestinationSlot != 0 &&
+                (!rackIsConnected() || rackSlotOccupied[autoDestinationSlot - 1])) {
+                failAutoTransfer("Placement cancelled: destination became occupied or rack went offline");
+                break;
+            }
             autoTransferMessage = "Extending fork to destination Y=" + String(autoDestinationY, 1) + " mm";
             moveToTopPosition(autoDestinationY);
-            autoTransferMessage = "Remove payload; waiting for load sensor to clear";
-            autoTransferState = AUTO_WAIT_FOR_UNLOAD;
+            autoTransferMessage = "Lowering Z slowly until payload is released";
+            autoPreviousZStepMS = 0;
+            autoTransferState = AUTO_LOWER_FOR_UNLOAD;
             break;
 
-        case AUTO_WAIT_FOR_UNLOAD:
+        case AUTO_LOWER_FOR_UNLOAD:
             if (!loadDetected) {
                 autoTransferMessage = "Payload removed; retracting fork";
                 autoTransferState = AUTO_RETRACT_FROM_DESTINATION;
+                break;
+            }
+            if (autoDestinationZ - autoWorkingZ >= AUTO_Z_MAX_SEARCH_MM) {
+                failAutoTransfer("Placement stopped: load still detected at Z search limit");
+                break;
+            }
+            if (autoPreviousZStepMS != 0 &&
+                millis() - autoPreviousZStepMS < AUTO_Z_STEP_PAUSE_MS) break;
+
+            autoWorkingZ -= AUTO_Z_STEP_MM;
+            autoTransferMessage = "Placement Z=" + String(autoWorkingZ) +
+                                  " mm; pressure=" + String(loadSensorValue);
+            if (startTowerMove(autoDestinationX, autoWorkingZ, "Placement Z step")) {
+                autoPreviousZStepMS = millis();
+                autoTransferState = AUTO_WAIT_LOWER_STEP;
+            } else {
+                failAutoTransfer("Could not lower Z during placement: " + towerMessage);
+            }
+            break;
+
+        case AUTO_WAIT_LOWER_STEP:
+            if (towerOperationCompletedEvent) {
+                towerOperationCompletedEvent = false;
+                if (!towerOperationSucceeded) {
+                    failAutoTransfer("Tower Z step failed during placement");
+                } else if (!loadDetected) {
+                    autoTransferMessage = "Payload released; retracting fork";
+                    autoTransferState = AUTO_RETRACT_FROM_DESTINATION;
+                } else {
+                    autoPreviousZStepMS = millis();
+                    autoTransferState = AUTO_LOWER_FOR_UNLOAD;
+                }
             }
             break;
 
@@ -1455,6 +1724,8 @@ void handleAutoTransfer() {
     autoDestinationX = static_cast<int32_t>(server.arg("dx").toInt());
     autoDestinationY = destinationY;
     autoDestinationZ = static_cast<int32_t>(server.arg("dz").toInt());
+    autoSourceSlot = 0;
+    autoDestinationSlot = 0;
     autoAbortRequested = false;
     towerOperationCompletedEvent = false;
     autoTransferMessage = "XYZ transfer accepted";
@@ -1474,6 +1745,106 @@ void handleAutoAbort() {
     autoTransferMessage = asrsMaster.operationActive()
         ? "Abort requested; waiting for current tower move to finish"
         : "Abort requested";
+    server.send(202, "text/plain", autoTransferMessage);
+}
+
+void handleSlotSave() {
+    if (!server.hasArg("slot") || !server.hasArg("x") ||
+        !server.hasArg("y") || !server.hasArg("z")) {
+        server.send(400, "text/plain", "Slot number and X/Y/Z values are required");
+        return;
+    }
+
+    const int slotNumber = server.arg("slot").toInt();
+    const float y = server.arg("y").toFloat();
+    if (slotNumber < 1 || slotNumber > 4) {
+        server.send(400, "text/plain", "Slot number must be 1 to 4");
+        return;
+    }
+    if (y < -300.0f || y > 300.0f) {
+        server.send(400, "text/plain", "Slot Y must be between -300 and +300 mm");
+        return;
+    }
+
+    const int32_t x = static_cast<int32_t>(server.arg("x").toInt());
+    const int32_t z = static_cast<int32_t>(server.arg("z").toInt());
+    if (!saveSlotCoordinate(slotNumber - 1, x, y, z)) {
+        server.send(500, "text/plain", "Could not save slot coordinate to flash");
+        return;
+    }
+
+    String message = "Slot " + String(slotNumber) + " saved: X=" + String(x) +
+                     ", Y=" + String(y, 1) + ", Z=" + String(z);
+    server.send(200, "text/plain", message);
+}
+
+void handleSlotTransfer() {
+    if (!server.hasArg("source") || !server.hasArg("destination")) {
+        server.send(400, "text/plain", "Pick and place slot numbers are required");
+        return;
+    }
+
+    const int source = server.arg("source").toInt();
+    const int destination = server.arg("destination").toInt();
+    if (source < 1 || source > 4 || destination < 1 || destination > 4) {
+        server.send(400, "text/plain", "Slot numbers must be 1 to 4");
+        return;
+    }
+    if (source == destination) {
+        server.send(400, "text/plain", "Pick and place slots must be different");
+        return;
+    }
+    if (!slotCoordinates[source - 1].configured ||
+        !slotCoordinates[destination - 1].configured) {
+        server.send(409, "text/plain", "Save both slot coordinates before transferring");
+        return;
+    }
+    if (!rackIsConnected()) {
+        server.send(503, "text/plain", "Rack is offline; slot occupancy cannot be verified");
+        return;
+    }
+    if (!rackSlotOccupied[source - 1]) {
+        server.send(409, "text/plain", "Cannot pick: source slot is empty");
+        return;
+    }
+    if (rackSlotOccupied[destination - 1]) {
+        server.send(409, "text/plain", "Cannot place: destination slot is occupied");
+        return;
+    }
+    if (!asrsSession.connected()) {
+        server.send(503, "text/plain", "ASRS tower is not connected");
+        return;
+    }
+    if (!homeConfigured) {
+        server.send(409, "text/plain", "Home the fork before starting a slot transfer");
+        return;
+    }
+    if (asrsMaster.operationActive() || autoTransferState != AUTO_IDLE) {
+        server.send(409, "text/plain", "Tower or automatic transfer is busy");
+        return;
+    }
+
+    updateLoadSensor();
+    if (loadDetected) {
+        server.send(409, "text/plain", "Remove the existing fork payload before starting");
+        return;
+    }
+
+    const SlotCoordinate &sourceCoordinate = slotCoordinates[source - 1];
+    const SlotCoordinate &destinationCoordinate = slotCoordinates[destination - 1];
+    autoSourceX = sourceCoordinate.x;
+    autoSourceY = sourceCoordinate.y;
+    autoSourceZ = sourceCoordinate.z;
+    autoDestinationX = destinationCoordinate.x;
+    autoDestinationY = destinationCoordinate.y;
+    autoDestinationZ = destinationCoordinate.z;
+    autoSourceSlot = source;
+    autoDestinationSlot = destination;
+    autoAbortRequested = false;
+    towerOperationCompletedEvent = false;
+    autoTransferMessage = "Slot " + String(source) + " to slot " +
+                          String(destination) + " transfer accepted";
+    autoTransferState = AUTO_MOVE_TO_SOURCE;
     server.send(202, "text/plain", autoTransferMessage);
 }
 
@@ -1525,7 +1896,7 @@ void handleStatus() {
 
     updateLoadSensor();
 
-    bool rackConnected = rackHasReported && (millis() - lastRackUpdateMS <= RACK_OFFLINE_TIMEOUT_MS);
+    bool rackConnected = rackIsConnected();
 
     uint8_t rackOccupiedCount = 0;
 
@@ -1594,6 +1965,21 @@ void handleStatus() {
     json += "\"autoTransferActive\":" + String(autoTransferState != AUTO_IDLE ? "true" : "false") + ",";
 
     json += "\"autoTransferMessage\":\"" + autoTransferMessage + "\",";
+
+    for (uint8_t i = 0; i < 4; i++) {
+
+        const String slotNumber = String(i + 1);
+
+        json += "\"slot" + slotNumber + "Configured\":" +
+                String(slotCoordinates[i].configured ? "true" : "false") + ",";
+
+        json += "\"slot" + slotNumber + "X\":" + String(slotCoordinates[i].x) + ",";
+
+        json += "\"slot" + slotNumber + "Y\":" + String(slotCoordinates[i].y, 1) + ",";
+
+        json += "\"slot" + slotNumber + "Z\":" + String(slotCoordinates[i].z) + ",";
+
+    }
 
     json += "\"homing\":" + String(isHoming ? "true" : "false") + ",";
 
@@ -1701,6 +2087,8 @@ void setup() {
 
     updateLoadSensor();
 
+    loadSavedSlotCoordinates();
+
 
 
     // One channel and one receive callback are shared by the rack and tower.
@@ -1748,6 +2136,10 @@ void setup() {
     server.on("/auto-transfer", HTTP_GET, handleAutoTransfer);
 
     server.on("/auto-abort", HTTP_GET, handleAutoAbort);
+
+    server.on("/slot-save", HTTP_GET, handleSlotSave);
+
+    server.on("/slot-transfer", HTTP_GET, handleSlotTransfer);
 
     server.on("/rack-update", HTTP_POST, handleRackUpdate);
 
