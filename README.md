@@ -8,7 +8,7 @@ Arduino/ESP32 firmware for a three-controller Automated Storage and Retrieval Sy
 - **External tower:** X/Z positioning is supplied by another developer and accessed only through the existing `ASRSCommunication` interface.
 - **Rack slave:** headless four-slot occupancy sensing and ESP-NOW reporting, with no access point or web server.
 
-The fork uses signed Y coordinates from `-300 mm` to `+300 mm`. The configured tower limits are X `500...2500 mm` and Z `400...1600 mm`.
+The fork uses signed Y coordinates from `-300 mm` to `+300 mm`. The fork master accepts tower X coordinates up to `2500 mm` and Z coordinates up to `1400 mm`; confirm the tower's physical lower limits with its developer before commissioning.
 
 > **Safety:** This is research prototype firmware, not a safety-rated motion controller. Install a physical emergency stop, hard limits, driver protection, and mechanical stops. Test with motors disconnected first.
 
@@ -104,9 +104,9 @@ All devices must use the same ESP-NOW channel (`1` by default).
 Connect to the fork UI:
 
 ```text
-SSID: ASRS-Fork-Control
-Password: asrscontrol
-URL: http://192.168.4.1/
+SSID: MSD_G14_ForkControl
+Password: forksetup
+URL: http://192.168.10.1/
 ```
 
 The rack does not create a Wi-Fi network or host a webpage. Its slot states are shown only through the fork master's web interface and Serial Monitor diagnostics.
@@ -143,48 +143,53 @@ Calibrate these thresholds using actual loaded and unloaded readings.
 ## Web features
 
 - Live X/Y/Z, load, tower, and rack status
-- Four rack occupancy indicators
-- Pick, Place, Home, and Stop controls
-- Independent X/Y/Z Move, Pick, and Place controls that are not tied to rack slots
+- Four rack occupancy indicators and persisted slot coordinates
+- Latched software emergency stop and reset controls
+- Y-only, selected tower-axis, and combined Y-then-X/Z homing
+- Combined X/Y/Z movement with automatic Y retraction before tower travel
+- Slot-to-slot, independent-to-slot, and slot-to-independent transfers
+- Configurable `0...100 mm` pickup/place Z offset
 - Four editable saved locations persisted with `Preferences`
 - Operation progress and error/success feedback
 
-Saved coordinates are validated against X `500...2500`, Y `-300...300`, and Z `400...1600` millimetres.
+Saved and manual coordinates are validated as whole millimetres with X no greater than `2500`, Y within `-300...300`, and Z no greater than `1400`. Placement Z plus its configured offset must also remain within `1400 mm`.
 
-### Independent coordinate operations
+### Coordinate operations
 
-The web interface accepts a manual X/Y/Z target independently from the four rack slots:
+The web interface supports manual movement and transfers that mix independent coordinates with saved rack slots:
 
-- **Move to position** retracts Y, moves the tower to X/Z, waits for `DONE`, then extends Y to the requested coordinate.
-- **Pick here** performs the load-acquisition sequence at the entered coordinate without requiring a rack slot to be occupied.
-- **Place here** performs the load-release sequence without requiring a rack slot to be empty.
+- **Move to X/Y/Z** retracts Y, moves the tower to X/Z, waits for `DONE`, then extends Y to the requested coordinate.
+- **Transfer between slots** validates source/destination occupancy and uses their saved coordinates.
+- **Independent pick to place slot** picks from an entered coordinate and validates that the destination slot is empty.
+- **Pick slot to independent place** validates that the source slot is occupied and places at an entered coordinate.
 
-Manual Pick still requires the fork to be unloaded, and Manual Place still requires a detected load. Rack occupancy validation and post-operation rack confirmation apply only to operations started from the Rack section. If Y is extended from a previous manual position, the controller retracts it to zero before issuing the next tower X/Z movement.
+Every automatic transfer starts with an unloaded fork. Rack occupancy validation applies to each saved slot used by the operation. If Y is extended from a previous position, the controller retracts it to zero before issuing the next tower X/Z movement.
 
 ## Pick sequence
 
 1. Require a homed system, fresh rack status, occupied slot, and unloaded fork.
 2. Require Y at zero before moving tower X/Z.
 3. Wait for tower `DONE`.
-4. Extend to saved signed Y.
-5. Raise Z in bounded 2 mm ASRS moves until stable load detection.
-6. Abort after 30 mm without detection.
+4. Move to the source Z coordinate minus the configured offset, then extend to the source Y coordinate.
+5. Raise Z in bounded 6 mm ASRS moves until stable load detection, retrying a rejected step up to three times.
+6. Abort after 100 mm of probing without detection.
 7. Retract Y and require the rack to report the slot empty.
 
 ## Place sequence
 
-Place uses the inverse validation: the slot must be empty and the fork loaded. Z lowers in bounded 2 mm moves until stable load release; Y then retracts and the rack must report the slot occupied.
+Place moves to the destination Z coordinate plus the configured offset, extends Y, and lowers Z in bounded 6 mm moves until stable load release. Y then retracts and, when the destination is a rack slot, the rack must report that slot occupied.
 
 ## Interlocks
 
 - Pick/place is disabled until fork and tower homing complete.
+- A latched software emergency stop immediately disables local fork stepping and blocks new movement until reset.
 - Tower travel requires Y retracted to zero.
 - Fork extension requires tower `DONE`.
 - Pick from empty and place into occupied are rejected.
 - Load state is validated before and during transfer.
 - Y outside `-300...300 mm` is rejected.
 - Rack data older than five seconds is offline.
-- The browser sends a 500 ms heartbeat, and successful status polling also renews the control lease. Loss for 10 seconds stops local Y motion and prevents subsequent tower commands.
+- Auxiliary rack discovery broadcasts are suppressed while any axis or transfer operation is active to keep the ESP-NOW radio quiet during motion.
 
 ### Tower limit recovery
 
@@ -217,7 +222,7 @@ Before commissioning, confirm the following with the tower developer:
 - Whether coordinate requests are valid while an operation is active
 - Behavior after communication loss or controller reset
 - How the tower can be stopped safely, because the current protocol has no STOP command
-- Whether the tower accepts repeated 2 mm Z target commands used for load acquisition and release
+- Whether the tower accepts repeated 6 mm Z target commands used for load acquisition and release
 
 ## Commissioning checklist
 
